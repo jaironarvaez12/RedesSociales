@@ -672,8 +672,9 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
     $it  = Dominios_Contenido_DetallesModel::findOrFail($detalle);
 
     $request->validate([
-        'schedule_at' => ['required'], // viene como datetime-local
+    'schedule_at' => ['required', 'date'], // viene en ISO UTC (Z)
     ]);
+    $scheduleAtUtcIso = (string) $request->input('schedule_at'); // ya viene UTC
 
     $it->estatus = 'en_proceso';
     $it->error = null;
@@ -694,13 +695,13 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
 
         $type = ($it->tipo === 'page') ? 'page' : 'post';
 
-        $payload = [
+       $payload = [
             'type'        => $type,
             'wp_id'       => $it->wp_id ?: null,
             'title'       => $it->title ?: ($it->keyword ?: 'Sin título'),
             'content'     => $it->contenido_html ?: '',
             'status'      => 'future',
-            'schedule_at' => $dtUtcIso, // ✅ con zona
+            'schedule_at' => $scheduleAtUtcIso, // ✅ se manda así al plugin
         ];
 
         $body = json_encode($payload, JSON_UNESCAPED_UNICODE);

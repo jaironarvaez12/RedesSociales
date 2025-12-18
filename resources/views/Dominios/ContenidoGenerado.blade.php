@@ -280,6 +280,34 @@ document.addEventListener('DOMContentLoaded', () => {
     const btn = scheduleForm.querySelector('button[type="submit"]');
     if (btn) btn.disabled = true;
   });
+
+
+
+  const scheduleAtIso = document.getElementById('scheduleAtIso');
+
+scheduleForm.addEventListener('submit', (e) => {
+  // toma lo que elegiste en tu hora local
+  const localVal = scheduleAt.value; // ej: 2025-12-19T10:30
+  if (!localVal) {
+    e.preventDefault();
+    alert('Selecciona fecha y hora');
+    return;
+  }
+
+  // ✅ convierte a una fecha real en tu zona horaria (la del sistema)
+  const dt = new Date(localVal);
+
+  // ✅ mandamos UTC ISO a Laravel (WordPress lo interpretará perfecto)
+  scheduleAtIso.value = dt.toISOString(); // ej: 2025-12-19T16:30:00.000Z
+
+  if (!confirm('¿Seguro que deseas PROGRAMAR este contenido en WordPress?')) {
+    e.preventDefault();
+    return;
+  }
+
+  const btn = scheduleForm.querySelector('button[type="submit"]');
+  if (btn) btn.disabled = true;
+});
 });
 </script>
 <script>
@@ -308,7 +336,10 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="mb-8 fw-semibold" id="scheduleTitle"></div>
 
         <label class="form-label fw-semibold">Fecha y hora</label>
-        <input type="datetime-local" name="schedule_at" id="scheduleAt" class="form-control" required>
+       <input type="datetime-local" name="schedule_at_local" id="scheduleAt" class="form-control" required>
+
+        {{-- ✅ esto es lo que realmente enviamos a Laravel --}}
+        <input type="hidden" name="schedule_at" id="scheduleAtIso">
 
         <div class="text-sm text-secondary-light mt-8">
           Se enviará a WordPress. Si la fecha está en el futuro, quedará como <strong>Programado</strong>.
