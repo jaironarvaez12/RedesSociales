@@ -14,7 +14,8 @@ use Illuminate\Support\Str;
 class GenerarContenidoKeywordJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
-
+    public $timeout = 300;   // 5 min (ajusta según tu caso)
+    public $tries = 1;       // para que no se duplique mientras pruebas
     public function __construct(
         public string $idDominio,
         public string $idDominioContenido,

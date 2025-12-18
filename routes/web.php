@@ -33,6 +33,8 @@ Route::group(['middleware' => 'auth'], function(){
 Route::post('dominios/{dominio}/contenido/{detalle}/publicar', [App\Http\Controllers\DominiosController::class, 'publicar'])
   ->name('dominios.contenido.publicar');
 
+  Route::post('dominios/{dominio}/contenido/{detalle}/programar', [App\Http\Controllers\DominiosController::class, 'programar'])
+    ->name('dominios.contenido.programar');
     //PERFILES
     Route::resource('perfiles','App\Http\Controllers\PerfilesController');
   

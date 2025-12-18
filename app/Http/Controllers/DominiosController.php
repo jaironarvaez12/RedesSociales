@@ -664,4 +664,82 @@ public function ContenidoGenerado(Request $request, string $IdDominio)
         return back()->with('error', 'Error publicando en WordPress: ' . $e->getMessage());
     }
 }
+
+
+public function programar(Request $request, $dominio, int $detalle): RedirectResponse
+{
+    $dom = DominiosModel::findOrFail($dominio);
+    $it  = Dominios_Contenido_DetallesModel::findOrFail($detalle);
+
+    $request->validate([
+        'schedule_at' => ['required', 'date'],
+    ]);
+
+    $it->estatus = 'en_proceso';
+    $it->error = null;
+    $it->save();
+
+    try {
+        $secret = (string) env('WP_WEBHOOK_SECRET');
+        if ($secret === '') throw new \RuntimeException('WP_WEBHOOK_SECRET no configurado en .env');
+
+        $wpBase = rtrim((string)$dom->url, '/');
+        $urlRest = $wpBase . '/wp-json/lws/v1/upsert';
+        $urlFallback = $wpBase . '/wp-admin/admin-post.php?action=lws_upsert';
+
+        $type = ($it->tipo === 'page') ? 'page' : 'post';
+
+        // schedule_at: viene del input datetime-local (ej: 2025-12-19T10:30)
+        // lo normalizamos a "Y-m-d H:i:s"
+        $scheduleAt = str_replace('T', ' ', (string)$request->input('schedule_at'));
+
+        $payload = [
+            'type'        => $type,
+            'wp_id'       => $it->wp_id ?: null,
+            'title'       => $it->title ?: ($it->keyword ?: 'Sin título'),
+            'content'     => $it->contenido_html ?: '',
+            'status'      => 'future', // el plugin igual lo valida por schedule_at
+            'schedule_at' => $scheduleAt,
+        ];
+
+        $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        $ts = time();
+        $sig = hash_hmac('sha256', $ts . '.' . $body, $secret);
+
+        $headers = [
+            'Content-Type' => 'application/json',
+            'X-Timestamp'  => (string)$ts,
+            'X-Signature'  => $sig,
+        ];
+
+        $resp = Http::timeout(25)->withHeaders($headers)->send('POST', $urlRest, ['body' => $body]);
+
+        if (in_array($resp->status(), [404, 405], true)) {
+            $resp = Http::timeout(25)->withHeaders($headers)->send('POST', $urlFallback, ['body' => $body]);
+        }
+
+        $json = $resp->json();
+
+        if (!$resp->ok() || !is_array($json) || empty($json['ok'])) {
+            $msg = is_array($json) ? ($json['message'] ?? 'Error desconocido') : ('HTTP ' . $resp->status());
+            $it->estatus = 'error';
+            $it->error = $msg;
+            $it->save();
+            return back()->with('error', 'No se pudo programar: ' . $msg);
+        }
+
+        // OK: el WP quedará en future
+        $it->estatus = 'generado'; // o crea un estado "programado" si quieres
+        $it->wp_id = (int)($json['wp_id'] ?? 0) ?: $it->wp_id;
+        $it->wp_link = (string)($json['link'] ?? '');
+        $it->save();
+
+        return back()->with('exito', 'Contenido programado correctamente en WordPress.');
+    } catch (\Throwable $e) {
+        $it->estatus = 'error';
+        $it->error = $e->getMessage();
+        $it->save();
+        return back()->with('error', 'Error programando en WordPress: ' . $e->getMessage());
+    }
+}
 }

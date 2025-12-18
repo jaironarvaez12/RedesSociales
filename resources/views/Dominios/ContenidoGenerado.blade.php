@@ -141,6 +141,14 @@
                         <iconify-icon icon="mdi:publish" class="menu-icon"></iconify-icon>
                       </button>
                     </form>
+                    <button type="button"
+                      class="bg-info-focus text-info-600 bg-hover-info-200 fw-medium w-40-px h-40-px d-flex justify-content-center align-items-center rounded-circle border-0 btn-schedule"
+                      title="Programar"
+                      data-id="{{ $it->id_dominio_contenido_detalle }}"
+                      data-title="{{ e($it->title ?: '(Sin título)') }}"
+                      {{ in_array($it->estatus, ['publicado','en_proceso']) ? 'disabled' : '' }}>
+                      <iconify-icon icon="mdi:calendar-clock" class="menu-icon"></iconify-icon>
+                    </button>
                   </div>
                 </td>
               </tr>
@@ -227,6 +235,47 @@ document.addEventListener('DOMContentLoaded', () => {
       modal.show();
     });
   });
+
+
+
+
+    // ---- Programar ----
+  const scheduleModalEl = document.getElementById('modalSchedule');
+  const scheduleModal = new bootstrap.Modal(scheduleModalEl);
+  const scheduleForm = document.getElementById('scheduleForm');
+  const scheduleTitle = document.getElementById('scheduleTitle');
+  const scheduleAt = document.getElementById('scheduleAt');
+
+  document.querySelectorAll('.btn-schedule').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.id;
+      const title = btn.dataset.title || '';
+
+      scheduleTitle.textContent = title;
+
+      // action a la ruta nueva
+      scheduleForm.action = `{{ url('dominios/'.$IdDominio.'/contenido') }}/${id}/programar`;
+
+      // default: +30min
+      const now = new Date();
+      now.setMinutes(now.getMinutes() + 30);
+      const pad = n => String(n).padStart(2,'0');
+      const val = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      scheduleAt.value = val;
+
+      scheduleModal.show();
+    });
+  });
+
+  // evitar doble submit
+  scheduleForm.addEventListener('submit', (e) => {
+    if (!confirm('¿Seguro que deseas PROGRAMAR este contenido en WordPress?')) {
+      e.preventDefault();
+      return;
+    }
+    const btn = scheduleForm.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+  });
 });
 </script>
 <script>
@@ -241,4 +290,32 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 </script>
+{{-- Modal Programar --}}
+<div class="modal fade" id="modalSchedule" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <form method="POST" id="scheduleForm" class="modal-content">
+      @csrf
+      <div class="modal-header">
+        <h6 class="modal-title fw-semibold">Programar publicación</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button>
+      </div>
+
+      <div class="modal-body">
+        <div class="mb-8 fw-semibold" id="scheduleTitle"></div>
+
+        <label class="form-label fw-semibold">Fecha y hora</label>
+        <input type="datetime-local" name="schedule_at" id="scheduleAt" class="form-control" required>
+
+        <div class="text-sm text-secondary-light mt-8">
+          Se enviará a WordPress. Si la fecha está en el futuro, quedará como <strong>Programado</strong>.
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancelar</button>
+        <button type="submit" class="btn btn-primary">Programar</button>
+      </div>
+    </form>
+  </div>
+</div>
 @endsection
