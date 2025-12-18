@@ -192,8 +192,27 @@ Route::post('/wp/inventory', function (Request $r) use ($getSecret, $validate, $
     }
     $merged = array_values($byId);
 
-    // guardamos tmp (TTL 30 min)
+   // guardamos tmp (TTL 30 min)
     Cache::put($tmpKey, $merged, now()->addMinutes(30));
+
+    /* ✅ PEGA ESTO AQUÍ: PUBLICAR SNAPSHOT PARCIAL EN CADA BATCH */
+    Cache::put("inv:{$siteKey}:{$type}", $merged, now()->addMinutes(30));
+
+    $counts = [];
+    foreach ($merged as $it) {
+        $st = (string)($it['status'] ?? '');
+        if ($st === '') $st = 'unknown';
+        $counts[$st] = ($counts[$st] ?? 0) + 1;
+    }
+    Cache::put("inv_counts:{$siteKey}:{$type}", $counts, now()->addMinutes(30));
+
+    Cache::put("inv_meta:{$siteKey}:{$type}", [
+        'run_id'       => $runId,
+        'is_complete'  => $isLast,
+        'updated_at'   => now()->toDateTimeString(),
+    ], now()->addMinutes(30));
+    /* ✅ FIN PEGADO */
+
 
     // si es el último batch => publicamos snapshot final
     if ($isLast) {
