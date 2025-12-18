@@ -27,7 +27,7 @@ Route::post('/wp/webhook', function (Request $r) {
     // ✅ Secret (recomendado desde config/services.php; fallback a env)
     $secret = config('services.wp_webhook.secret');
     if (!is_string($secret) || trim($secret) === '') {
-        $secret = env('WP_WEBHOOK_SECRET');
+       $secret = config('services.wp_webhook.secret');
     }
     $secret = is_string($secret) ? trim($secret) : null;
     if ($secret === '') $secret = null;

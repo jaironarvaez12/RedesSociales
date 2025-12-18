@@ -40,5 +40,8 @@ return [
     'redirect'      => env('FACEBOOK_REDIRECT_URI'),
     'version'       => env('FACEBOOK_API_VERSION', 'v21.0'),
 ],
+'wp_webhook' => [
+    'secret' => env('WP_WEBHOOK_SECRET'),
+],
 
 ];
