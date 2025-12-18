@@ -15,6 +15,7 @@ class Dominios_Contenido_DetallesModel extends Model
 
     public $incrementing = true;     // ✅ autoincrement
     protected $keyType = 'int';      // ✅
+protected $casts = ['scheduled_at' => 'datetime'];
 
     protected $fillable = [
         'id_dominio_contenido',
@@ -40,6 +41,8 @@ class Dominios_Contenido_DetallesModel extends Model
         'draft_html',
         'modelo',
         'wp_id',
-        'wp_link'
+        'wp_link',
+      
+        
     ];
 }

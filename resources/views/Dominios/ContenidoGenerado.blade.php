@@ -94,6 +94,7 @@
               <th>Título</th>
               <th>Keyword</th>
               <th>Fecha</th>
+              <th>Programado para</th>
               <th class="text-center">Acción</th>
             </tr>
           </thead>
@@ -121,6 +122,15 @@
                 <td>{{ $it->title ?: '(Sin título)' }}</td>
                 <td>{{ $it->keyword }}</td>
                 <td>{{ $it->created_at }}</td>
+                <td>
+                  @if($it->estatus === 'programado')
+                    <span class="fw-medium">
+                      {{ $it->scheduled_at ? $it->scheduled_at->format('Y-m-d H:i') : '—' }}
+                    </span>
+                  @else
+                    —
+                  @endif
+                </td>
                 <td class="text-center">
                   <div class="d-flex align-items-center gap-10 justify-content-center">
                     <button type="button"

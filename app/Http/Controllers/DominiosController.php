@@ -672,7 +672,7 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
     $it  = Dominios_Contenido_DetallesModel::findOrFail($detalle);
 
     $request->validate([
-        'schedule_at' => ['required', 'string'], // viene como ISO UTC (ej: ...Z)
+        'schedule_at' => ['required', 'string'], // ISO UTC desde el hidden (ej: ...Z)
     ]);
 
     $it->estatus = 'en_proceso';
@@ -685,8 +685,8 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
             throw new \RuntimeException('WP_WEBHOOK_SECRET no configurado en .env');
         }
 
-        // ✅ schedule_at viene ISO (UTC). Lo parseamos robusto y normalizamos a UTC ISO
-        $scheduleAtRaw = (string) $request->input('schedule_at'); // ej: 2025-12-19T16:30:00.000Z
+        // schedule_at viene en ISO UTC (Z). Parse robusto y normalización.
+        $scheduleAtRaw = (string) $request->input('schedule_at');
 
         try {
             $dtUtc = Carbon::parse($scheduleAtRaw)->setTimezone('UTC');
@@ -694,7 +694,8 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
             throw new \RuntimeException('Fecha inválida en schedule_at: ' . $scheduleAtRaw);
         }
 
-        $scheduleAtUtcIso = $dtUtc->toIso8601String(); // ej: 2025-12-19T16:30:00+00:00
+        // ISO limpio para enviar al plugin
+        $scheduleAtUtcIso = $dtUtc->toIso8601String(); // 2025-12-19T16:30:00+00:00
 
         $wpBase = rtrim((string) $dom->url, '/');
         $urlRest = $wpBase . '/wp-json/lws/v1/upsert';
@@ -708,7 +709,7 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
             'title'       => $it->title ?: ($it->keyword ?: 'Sin título'),
             'content'     => $it->contenido_html ?: '',
             'status'      => 'future',
-            'schedule_at' => $scheduleAtUtcIso, // ✅ UTC ISO limpio
+            'schedule_at' => $scheduleAtUtcIso,
         ];
 
         $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
@@ -738,18 +739,32 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
             return back()->with('error', 'No se pudo programar: ' . $msg);
         }
 
-        // ✅ Guardar estatus según WP
-        $wpStatus = (string) ($json['status'] ?? '');
-        if ($wpStatus === 'future') {
-            $it->estatus = 'programado';
-        } elseif ($wpStatus === 'publish') {
-            $it->estatus = 'publicado';
-        } else {
-            $it->estatus = 'generado';
-        }
-
+        // Guardar ID y link siempre que existan
         $it->wp_id   = (int) ($json['wp_id'] ?? 0) ?: $it->wp_id;
         $it->wp_link = (string) ($json['link'] ?? '');
+
+        // Guardar estatus según WP + scheduled_at
+        $wpStatus = (string) ($json['status'] ?? '');
+
+        if ($wpStatus === 'future') {
+            $it->estatus = 'programado';
+
+            // ✅ ideal: usar fecha exacta que WP guardó (si plugin la devuelve)
+            if (!empty($json['scheduled_gmt'])) {
+                $it->scheduled_at = Carbon::parse($json['scheduled_gmt'], 'UTC')
+                    ->setTimezone(config('app.timezone'));
+            } else {
+                // fallback: usa lo que tú mandaste
+                $it->scheduled_at = $dtUtc->copy()->setTimezone(config('app.timezone'));
+            }
+        } elseif ($wpStatus === 'publish') {
+            $it->estatus = 'publicado';
+            $it->scheduled_at = null;
+        } else {
+            $it->estatus = 'generado';
+            $it->scheduled_at = null;
+        }
+
         $it->save();
 
         return back()->with('exito', 'Contenido programado correctamente en WordPress.');
@@ -760,5 +775,4 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
 
         return back()->with('error', 'Error programando en WordPress: ' . $e->getMessage());
     }
-}
 }
