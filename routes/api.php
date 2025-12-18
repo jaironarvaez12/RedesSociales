@@ -159,37 +159,80 @@ Route::post('/wp/inventory', function (Request $r) use ($getSecret, $validate, $
 
     if (!$ok) {
         $rememberRejected('wp_inventory_last', $r, $payload, $reason);
-        Log::warning('WP INVENTORY UNAUTHORIZED', ['ip'=>$r->ip(), 'reason'=>$reason, 'site'=>$payload['site'] ?? null]);
         return response()->json(['ok'=>false,'error'=>'unauthorized','reason'=>$reason], 401);
     }
 
-    $site = (string)($payload['site'] ?? 'unknown');
-    $type = (string)($payload['type'] ?? 'page');
+    $site = rtrim((string)($payload['site'] ?? ''), '/');
+    $type = (string)($payload['type'] ?? '');
+    $runId = (string)($payload['run_id'] ?? '');
+    $isLast = (bool)($payload['is_last'] ?? false);
     $items = $payload['items'] ?? [];
-    $received = is_array($items) ? count($items) : 0;
+    if (!is_array($items)) $items = [];
 
-    // Guardamos último inventario por site (cache) para prueba
-    $key = 'wp_inventory_last_' . md5($site);
+    if ($site === '' || !in_array($type, ['post','page'], true) || $runId === '') {
+        return response()->json(['ok'=>false,'error'=>'bad_payload'], 422);
+    }
 
-    Cache::put($key, [
+    $siteKey = md5($site);
+
+    // tmp key por corrida
+    $tmpKey = "inv_tmp:{$siteKey}:{$type}:{$runId}";
+
+    // acumulamos items en tmp
+    $current = Cache::get($tmpKey, []);
+    if (!is_array($current)) $current = [];
+
+    // merge con dedupe por wp_id
+    $byId = [];
+    foreach ($current as $it) {
+        if (is_array($it) && isset($it['wp_id'])) $byId[(int)$it['wp_id']] = $it;
+    }
+    foreach ($items as $it) {
+        if (is_array($it) && isset($it['wp_id'])) $byId[(int)$it['wp_id']] = $it;
+    }
+    $merged = array_values($byId);
+
+    // guardamos tmp (TTL 30 min)
+    Cache::put($tmpKey, $merged, now()->addMinutes(30));
+
+    // si es el último batch => publicamos snapshot final
+    if ($isLast) {
+        // ordenar por modified desc
+        usort($merged, function($a, $b) {
+            return strcmp((string)($b['modified'] ?? ''), (string)($a['modified'] ?? ''));
+        });
+
+        $finalKey = "inv:{$siteKey}:{$type}";
+        Cache::put($finalKey, $merged, now()->addMinutes(30));
+
+        // conteos por status
+        $counts = [];
+        foreach ($merged as $it) {
+            $st = (string)($it['status'] ?? '');
+            if ($st === '') $st = 'unknown';
+            $counts[$st] = ($counts[$st] ?? 0) + 1;
+        }
+        $countsKey = "inv_counts:{$siteKey}:{$type}";
+        Cache::put($countsKey, $counts, now()->addMinutes(30));
+
+        // limpiamos tmp para no llenar cache
+        Cache::forget($tmpKey);
+    }
+
+    // Para debug (último batch recibido)
+    Cache::put('wp_inventory_last_' . $siteKey, [
         'at' => now()->toDateTimeString(),
         'ip' => $r->ip(),
         'site' => $site,
         'type' => $type,
         'page' => $payload['page'] ?? null,
         'per_page' => $payload['per_page'] ?? null,
-        'received' => $received,
-        // OJO: si hay muchas páginas, guardar items completos en cache puede ser pesado.
-        // Para prueba lo dejamos; luego en producción lo guardamos a BD.
-        'items' => $items,
+        'received' => count($items),
+        'run_id' => $runId,
+        'is_last' => $isLast,
     ], now()->addMinutes(30));
 
-    return response()->json([
-        'ok' => true,
-        'site' => $site,
-        'type' => $type,
-        'received' => $received,
-    ]);
+    return response()->json(['ok'=>true,'site'=>$site,'type'=>$type,'received'=>count($items),'is_last'=>$isLast]);
 });
 
 Route::get('/wp/inventory/last', function (Request $r) {
@@ -216,4 +259,18 @@ Route::get('/wp/inventory/last', function (Request $r) {
     }
 
     return response()->json($out);
+});
+Route::get('/wp/inventory/snapshot', function (Request $r) {
+    $site = rtrim((string)$r->query('site', ''), '/');
+    if ($site === '') return response()->json(['ok'=>false,'error'=>'missing_site'], 400);
+
+    $siteKey = md5($site);
+
+    return response()->json([
+        'site' => $site,
+        'pages' => Cache::get("inv:{$siteKey}:page", []),
+        'posts' => Cache::get("inv:{$siteKey}:post", []),
+        'countPages' => Cache::get("inv_counts:{$siteKey}:page", []),
+        'countPosts' => Cache::get("inv_counts:{$siteKey}:post", []),
+    ]);
 });

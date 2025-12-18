@@ -15,6 +15,7 @@ use App\Services\WordpressService;
 use Illuminate\Support\Facades\Http;
 use App\Jobs\GenerarContenidoKeywordJob;
 use Illuminate\Http\RedirectResponse;
+use Illuminate\Support\Facades\Cache;
 class DominiosController extends Controller
 {
     /**
@@ -183,41 +184,44 @@ public function Crearcontenido(string $IdDominio)
 public function verWp($id, WordpressService $wp)
 {
     $dominio = DominiosModel::findOrFail($id);
+    $site = rtrim((string)$dominio->url, '/');
+    $siteKey = md5($site);
 
-    // Puedes cambiar estos defaults
-    $perPagePosts = (int) request('per_posts', 50);
-    $perPagePages = (int) request('per_pages', 50);
-    $pagePosts    = (int) request('page_posts', 1);
-    $pagePages    = (int) request('page_pages', 1);
+    $postsRaw = Cache::get("inv:{$siteKey}:post", []);
+    $pagesRaw = Cache::get("inv:{$siteKey}:page", []);
 
-    // Si quieres mostrar "todos los estados" en la tabla, usa este array.
-    // Si solo quieres drafts, deja ['draft'].
-    $statusesPosts = request('st_posts')
-        ? array_filter(explode(',', request('st_posts')))
-        : ['publish','draft','future','pending','private'];
+    $posts = array_map(fn($x) => [
+        'id' => $x['wp_id'] ?? null,
+        'slug' => $x['slug'] ?? null,
+        'status' => $x['status'] ?? null,
+        'date' => $x['date'] ?? null,
+        'link' => $x['link'] ?? null,
+        'title' => ['rendered' => $x['title'] ?? 'Sin título'],
+    ], is_array($postsRaw) ? $postsRaw : []);
 
-    $statusesPages = request('st_pages')
-        ? array_filter(explode(',', request('st_pages')))
-        : ['publish','draft','future','pending','private'];
+    $pages = array_map(fn($x) => [
+        'id' => $x['wp_id'] ?? null,
+        'slug' => $x['slug'] ?? null,
+        'status' => $x['status'] ?? null,
+        'date' => $x['date'] ?? null,
+        'link' => $x['link'] ?? null,
+        'title' => ['rendered' => $x['title'] ?? 'Sin título'],
+    ], is_array($pagesRaw) ? $pagesRaw : []);
 
-    // Listados
-    $posts = $wp->posts($dominio, $statusesPosts, $perPagePosts, $pagePosts);
-    $pages = $wp->pages($dominio, $statusesPages, $perPagePages, $pagePages);
+    $countPosts = Cache::get("inv_counts:{$siteKey}:post", []);
+    $countPages = Cache::get("inv_counts:{$siteKey}:page", []);
 
-    // Totales por estado (para las tarjetas)
-    $countPosts = $wp->countByStatus($dominio, 'posts', ['publish','draft','future','pending','private']);
-    $countPages = $wp->countByStatus($dominio, 'pages', ['publish','draft','future','pending','private']);
+    foreach (['publish','draft','future','pending','private'] as $st) {
+        $countPosts[$st] = $countPosts[$st] ?? 0;
+        $countPages[$st] = $countPages[$st] ?? 0;
+    }
+
+    // Solo para que tu vista no truene (ya no usamos paginado real)
+    $perPagePosts = 50; $perPagePages = 50; $pagePosts = 1; $pagePages = 1;
 
     return view('Dominios.DominioContenido', compact(
-        'dominio',
-        'posts',
-        'pages',
-        'countPosts',
-        'countPages',
-        'perPagePosts',
-        'perPagePages',
-        'pagePosts',
-        'pagePages'
+        'dominio','posts','pages','countPosts','countPages',
+        'perPagePosts','perPagePages','pagePosts','pagePages'
     ));
 }
 
