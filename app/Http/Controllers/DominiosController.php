@@ -184,44 +184,97 @@ public function Crearcontenido(string $IdDominio)
 public function verWp($id, WordpressService $wp)
 {
     $dominio = DominiosModel::findOrFail($id);
+
     $site = rtrim((string)$dominio->url, '/');
     $siteKey = md5($site);
 
+    // Raw snapshots (pueden ser [] si aún no llega nada)
     $postsRaw = Cache::get("inv:{$siteKey}:post", []);
     $pagesRaw = Cache::get("inv:{$siteKey}:page", []);
 
-    $posts = array_map(fn($x) => [
-        'id' => $x['wp_id'] ?? null,
-        'slug' => $x['slug'] ?? null,
-        'status' => $x['status'] ?? null,
-        'date' => $x['date'] ?? null,
-        'link' => $x['link'] ?? null,
-        'title' => ['rendered' => $x['title'] ?? 'Sin título'],
-    ], is_array($postsRaw) ? $postsRaw : []);
+    $postsRaw = is_array($postsRaw) ? $postsRaw : [];
+    $pagesRaw = is_array($pagesRaw) ? $pagesRaw : [];
 
-    $pages = array_map(fn($x) => [
-        'id' => $x['wp_id'] ?? null,
-        'slug' => $x['slug'] ?? null,
-        'status' => $x['status'] ?? null,
-        'date' => $x['date'] ?? null,
-        'link' => $x['link'] ?? null,
-        'title' => ['rendered' => $x['title'] ?? 'Sin título'],
-    ], is_array($pagesRaw) ? $pagesRaw : []);
+    // Meta para mostrar "sincronizando / parcial"
+    $metaPosts = Cache::get("inv_meta:{$siteKey}:post", []);
+    $metaPages = Cache::get("inv_meta:{$siteKey}:page", []);
 
+    $metaPosts = is_array($metaPosts) ? $metaPosts : [];
+    $metaPages = is_array($metaPages) ? $metaPages : [];
+
+    $syncPosts = [
+        'has_data'    => !empty($postsRaw),
+        'complete'    => (bool)($metaPosts['is_complete'] ?? false),
+        'updated_at'  => $metaPosts['updated_at'] ?? null,
+        'run_id'      => $metaPosts['run_id'] ?? null,
+    ];
+
+    $syncPages = [
+        'has_data'    => !empty($pagesRaw),
+        'complete'    => (bool)($metaPages['is_complete'] ?? false),
+        'updated_at'  => $metaPages['updated_at'] ?? null,
+        'run_id'      => $metaPages['run_id'] ?? null,
+    ];
+
+    // Ordenar por modified desc (por seguridad)
+    usort($postsRaw, fn($a, $b) => strcmp((string)($b['modified'] ?? ''), (string)($a['modified'] ?? '')));
+    usort($pagesRaw, fn($a, $b) => strcmp((string)($b['modified'] ?? ''), (string)($a['modified'] ?? '')));
+
+    // Mapear al formato que tu Blade espera (id + title.rendered)
+    $posts = array_map(function ($x) {
+        $title = $x['title'] ?? 'Sin título';
+        return [
+            'id'     => $x['wp_id'] ?? null,
+            'slug'   => $x['slug'] ?? null,
+            'status' => $x['status'] ?? null,
+            'date'   => $x['date'] ?? null,
+            'link'   => $x['link'] ?? null,
+            'title'  => ['rendered' => $title],
+            // opcional: por si quieres mostrarlo después
+            'modified' => $x['modified'] ?? null,
+        ];
+    }, $postsRaw);
+
+    $pages = array_map(function ($x) {
+        $title = $x['title'] ?? 'Sin título';
+        return [
+            'id'     => $x['wp_id'] ?? null,
+            'slug'   => $x['slug'] ?? null,
+            'status' => $x['status'] ?? null,
+            'date'   => $x['date'] ?? null,
+            'link'   => $x['link'] ?? null,
+            'title'  => ['rendered' => $title],
+            'modified' => $x['modified'] ?? null,
+        ];
+    }, $pagesRaw);
+
+    // Counts (si no han llegado aún, serán [])
     $countPosts = Cache::get("inv_counts:{$siteKey}:post", []);
     $countPages = Cache::get("inv_counts:{$siteKey}:page", []);
 
+    $countPosts = is_array($countPosts) ? $countPosts : [];
+    $countPages = is_array($countPages) ? $countPages : [];
+
     foreach (['publish','draft','future','pending','private'] as $st) {
-        $countPosts[$st] = $countPosts[$st] ?? 0;
-        $countPages[$st] = $countPages[$st] ?? 0;
+        $countPosts[$st] = (int)($countPosts[$st] ?? 0);
+        $countPages[$st] = (int)($countPages[$st] ?? 0);
     }
 
-    // Solo para que tu vista no truene (ya no usamos paginado real)
+    // Para que tu vista no truene (no paginamos “real” aquí)
     $perPagePosts = 50; $perPagePages = 50; $pagePosts = 1; $pagePages = 1;
 
     return view('Dominios.DominioContenido', compact(
-        'dominio','posts','pages','countPosts','countPages',
-        'perPagePosts','perPagePages','pagePosts','pagePages'
+        'dominio',
+        'posts',
+        'pages',
+        'countPosts',
+        'countPages',
+        'syncPosts',
+        'syncPages',
+        'perPagePosts',
+        'perPagePages',
+        'pagePosts',
+        'pagePages'
     ));
 }
 
