@@ -776,3 +776,4 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
         return back()->with('error', 'Error programando en WordPress: ' . $e->getMessage());
     }
 }
+}
