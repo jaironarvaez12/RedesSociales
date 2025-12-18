@@ -672,9 +672,8 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
     $it  = Dominios_Contenido_DetallesModel::findOrFail($detalle);
 
     $request->validate([
-    'schedule_at' => ['required', 'date'], // viene en ISO UTC (Z)
+        'schedule_at' => ['required', 'string'], // viene como ISO UTC (ej: ...Z)
     ]);
-    $scheduleAtUtcIso = (string) $request->input('schedule_at'); // ya viene UTC
 
     $it->estatus = 'en_proceso';
     $it->error = null;
@@ -682,26 +681,34 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
 
     try {
         $secret = (string) env('WP_WEBHOOK_SECRET');
-        if ($secret === '') throw new \RuntimeException('WP_WEBHOOK_SECRET no configurado en .env');
+        if ($secret === '') {
+            throw new \RuntimeException('WP_WEBHOOK_SECRET no configurado en .env');
+        }
 
-        // datetime-local -> Carbon en TZ de tu APP -> UTC ISO8601
-        $raw = (string)$request->input('schedule_at'); // ej: 2025-12-19T10:30
-        $dtLocal = Carbon::createFromFormat('Y-m-d\TH:i', $raw, config('app.timezone'));
-        $dtUtcIso = $dtLocal->copy()->setTimezone('UTC')->toIso8601String(); // 2025-12-19T16:30:00+00:00
+        // ✅ schedule_at viene ISO (UTC). Lo parseamos robusto y normalizamos a UTC ISO
+        $scheduleAtRaw = (string) $request->input('schedule_at'); // ej: 2025-12-19T16:30:00.000Z
 
-        $wpBase = rtrim((string)$dom->url, '/');
+        try {
+            $dtUtc = Carbon::parse($scheduleAtRaw)->setTimezone('UTC');
+        } catch (\Throwable $e) {
+            throw new \RuntimeException('Fecha inválida en schedule_at: ' . $scheduleAtRaw);
+        }
+
+        $scheduleAtUtcIso = $dtUtc->toIso8601String(); // ej: 2025-12-19T16:30:00+00:00
+
+        $wpBase = rtrim((string) $dom->url, '/');
         $urlRest = $wpBase . '/wp-json/lws/v1/upsert';
         $urlFallback = $wpBase . '/wp-admin/admin-post.php?action=lws_upsert';
 
         $type = ($it->tipo === 'page') ? 'page' : 'post';
 
-       $payload = [
+        $payload = [
             'type'        => $type,
             'wp_id'       => $it->wp_id ?: null,
             'title'       => $it->title ?: ($it->keyword ?: 'Sin título'),
             'content'     => $it->contenido_html ?: '',
             'status'      => 'future',
-            'schedule_at' => $scheduleAtUtcIso, // ✅ se manda así al plugin
+            'schedule_at' => $scheduleAtUtcIso, // ✅ UTC ISO limpio
         ];
 
         $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
@@ -710,11 +717,13 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
 
         $headers = [
             'Content-Type' => 'application/json',
-            'X-Timestamp'  => (string)$ts,
+            'X-Timestamp'  => (string) $ts,
             'X-Signature'  => $sig,
         ];
 
         $resp = Http::timeout(25)->withHeaders($headers)->send('POST', $urlRest, ['body' => $body]);
+
+        // fallback si wp-json está bloqueado
         if (in_array($resp->status(), [404, 405], true)) {
             $resp = Http::timeout(25)->withHeaders($headers)->send('POST', $urlFallback, ['body' => $body]);
         }
@@ -729,8 +738,8 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
             return back()->with('error', 'No se pudo programar: ' . $msg);
         }
 
-        // ✅ ESTATUS en Laravel según lo que devolvió WP
-        $wpStatus = (string)($json['status'] ?? '');
+        // ✅ Guardar estatus según WP
+        $wpStatus = (string) ($json['status'] ?? '');
         if ($wpStatus === 'future') {
             $it->estatus = 'programado';
         } elseif ($wpStatus === 'publish') {
@@ -739,8 +748,8 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
             $it->estatus = 'generado';
         }
 
-        $it->wp_id = (int)($json['wp_id'] ?? 0) ?: $it->wp_id;
-        $it->wp_link = (string)($json['link'] ?? '');
+        $it->wp_id   = (int) ($json['wp_id'] ?? 0) ?: $it->wp_id;
+        $it->wp_link = (string) ($json['link'] ?? '');
         $it->save();
 
         return back()->with('exito', 'Contenido programado correctamente en WordPress.');
@@ -748,6 +757,7 @@ public function programar(Request $request, $dominio, int $detalle): RedirectRes
         $it->estatus = 'error';
         $it->error = $e->getMessage();
         $it->save();
+
         return back()->with('error', 'Error programando en WordPress: ' . $e->getMessage());
     }
 }
