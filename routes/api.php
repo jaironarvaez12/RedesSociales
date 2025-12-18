@@ -5,71 +5,33 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Route;
 
-// (Opcional) Ruta default de Laravel si usas Sanctum
 Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
 });
 
 /**
- * Devuelve el secret para validar el webhook.
- * Por ahora usa .env (WP_WEBHOOK_SECRET).
- * (Más adelante, para multi-dominio, puedes resolver por $payload['site'].)
- */
-function wpWebhookSecret(array $payload): ?string
-{
-    $secret = env('WP_WEBHOOK_SECRET');
-    $secret = is_string($secret) ? trim($secret) : null;
-    return $secret !== '' ? $secret : null;
-}
-
-/**
- * Valida firma HMAC.
- * - Nuevo modo: firma de "timestamp.body" (X-Timestamp obligatorio)
- * - Modo compat: firma solo del body (si no llega X-Timestamp)
- */
-function wpWebhookValid(string $rawBody, ?string $secret, ?string $sig, ?int $ts): array
-{
-    if (!$secret || !$sig) {
-        return [false, 'missing_secret_or_signature'];
-    }
-
-    // Si llega timestamp => validamos ventana anti-replay
-    if ($ts !== null) {
-        // Ventana (segundos). Si tu server tiene hora rara, sube temporalmente a 900.
-        $window = 300;
-
-        if ($ts <= 0) {
-            return [false, 'invalid_timestamp'];
-        }
-        if (abs(time() - $ts) > $window) {
-            return [false, 'timestamp_out_of_window'];
-        }
-
-        $calc = hash_hmac('sha256', $ts . '.' . $rawBody, $secret);
-        return [hash_equals($calc, $sig), 'ts_body'];
-    }
-
-    // Compat: sin timestamp, firmamos body completo
-    $calc = hash_hmac('sha256', $rawBody, $secret);
-    return [hash_equals($calc, $sig), 'body_only'];
-}
-
-/**
- * Webhook receptor
+ * Webhook receptor (con soporte de:
+ *  - firma nueva: HMAC(ts.body) + ventana anti-replay
+ *  - firma compat: HMAC(body) si no llega ts
  */
 Route::post('/wp/webhook', function (Request $r) {
     $raw = (string) $r->getContent();
 
-    // headers
     $sig = $r->header('X-Signature');
     $tsHeader = $r->header('X-Timestamp');
     $ts = $tsHeader !== null ? (int) $tsHeader : null;
 
-    // Intenta parsear JSON (sin reventar)
     $payload = $r->json()->all();
     if (!is_array($payload)) $payload = [];
 
-    // Log de que sí llegó al endpoint
+    // ✅ Secret (recomendado desde config/services.php; fallback a env)
+    $secret = config('services.wp_webhook.secret');
+    if (!is_string($secret) || trim($secret) === '') {
+        $secret = env('WP_WEBHOOK_SECRET');
+    }
+    $secret = is_string($secret) ? trim($secret) : null;
+    if ($secret === '') $secret = null;
+
     Log::info('WP webhook HIT', [
         'ip' => $r->ip(),
         'has_sig' => (bool)$sig,
@@ -80,18 +42,48 @@ Route::post('/wp/webhook', function (Request $r) {
         'wp_id'   => $payload['wp_id'] ?? null,
     ]);
 
-    $secret = wpWebhookSecret($payload);
-
     // Validación
-    [$ok, $modeOrReason] = wpWebhookValid($raw, $secret, $sig ? (string)$sig : null, $ts);
+    $reason = null;
+    $mode = null;
 
-    if (!$ok) {
-        // Guarda el último rechazado para debug
+    if (!$secret || !$sig) {
+        $reason = 'missing_secret_or_signature';
+    } else {
+        $sig = (string) $sig;
+
+        if ($tsHeader !== null) {
+            // Ventana anti-replay (5 min)
+            $window = 300;
+
+            if ($ts <= 0) {
+                $reason = 'invalid_timestamp';
+            } elseif (abs(time() - $ts) > $window) {
+                $reason = 'timestamp_out_of_window';
+            } else {
+                $calc = hash_hmac('sha256', $ts . '.' . $raw, $secret);
+                if (!hash_equals($calc, $sig)) {
+                    $reason = 'bad_signature';
+                } else {
+                    $mode = 'ts_body';
+                }
+            }
+        } else {
+            // Compat: firma solo del body
+            $calc = hash_hmac('sha256', $raw, $secret);
+            if (!hash_equals($calc, $sig)) {
+                $reason = 'bad_signature';
+            } else {
+                $mode = 'body_only';
+            }
+        }
+    }
+
+    if ($reason !== null) {
         Cache::put('wp_webhook_last_rejected', [
             'at' => now()->toDateTimeString(),
             'ip' => $r->ip(),
-            'reason' => $modeOrReason,
-            'has_sig' => (bool)$sig,
+            'reason' => $reason,
+            'has_sig' => (bool)$r->header('X-Signature'),
             'has_ts' => $tsHeader !== null,
             'ts' => $tsHeader,
             'site' => $payload['site'] ?? null,
@@ -100,29 +92,24 @@ Route::post('/wp/webhook', function (Request $r) {
 
         Log::warning('WP webhook UNAUTHORIZED', [
             'ip' => $r->ip(),
-            'reason' => $modeOrReason,
+            'reason' => $reason,
             'ts' => $tsHeader,
             'site' => $payload['site'] ?? null,
         ]);
 
-        return response()->json(['ok' => false, 'error' => 'unauthorized', 'reason' => $modeOrReason], 401);
+        return response()->json(['ok' => false, 'error' => 'unauthorized', 'reason' => $reason], 401);
     }
 
-    // ✅ Guarda el último válido
     Cache::put('wp_webhook_last', [
         'at'   => now()->toDateTimeString(),
         'ip'   => $r->ip(),
-        'mode' => $modeOrReason, // ts_body | body_only
+        'mode' => $mode,
         'data' => $payload,
     ], now()->addMinutes(30));
 
     return response()->json(['ok' => true]);
 });
 
-/**
- * Ver el último webhook válido.
- * (Tip) si llamas ?debug=1 también te muestra el último rechazado.
- */
 Route::get('/wp/webhook/last', function (Request $r) {
     $out = [
         'last_ok' => Cache::get('wp_webhook_last', ['ok' => false, 'message' => 'Aún no ha llegado nada']),
