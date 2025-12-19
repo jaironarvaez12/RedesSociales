@@ -586,7 +586,12 @@ public function ContenidoGenerado(Request $request, string $IdDominio)
 
 
 
-   public function publicar($dominio, int $detalle): RedirectResponse
+   use Illuminate\Http\RedirectResponse;
+use Illuminate\Support\Facades\Http;
+use App\Models\DominiosModel;
+use App\Models\Dominios_Contenido_DetallesModel;
+
+public function publicar($dominio, int $detalle): RedirectResponse
 {
     $dom = DominiosModel::findOrFail($dominio);
     $it  = Dominios_Contenido_DetallesModel::findOrFail($detalle);
@@ -603,32 +608,41 @@ public function ContenidoGenerado(Request $request, string $IdDominio)
 
         $wpBase = rtrim((string)$dom->url, '/');
 
-        // Endpoint principal (REST del plugin)
         $urlRest = $wpBase . '/wp-json/lws/v1/upsert';
-        // Fallback si wp-json está bloqueado
         $urlFallback = $wpBase . '/wp-admin/admin-post.php?action=lws_upsert';
 
-        // Decide tipo + status
         $type = ($it->tipo === 'page') ? 'page' : 'post';
 
-        // Si quieres programar: manda schedule_at ISO (ej: 2025-12-19 10:00:00)
-        // Si no, publica normal.
+        if (empty($it->contenido_html)) {
+            throw new \RuntimeException('contenido_html está vacío (no hay nada que publicar).');
+        }
+
         $payload = [
-          'type'       => $type,
-          'wp_id'      => $it->wp_id ?: null,
-          'title'      => $it->title ?: ($it->keyword ?: 'Sin título'),
-          
-          // 👇 Aquí va el JSON Elementor guardado en BD (no HTML)
-          'content'    => $it->contenido_html ?: '',
-          
-          // 👇 Recomendado: bandera explícita
-          'builder'    => 'elementor',
-          
-          'status'     => 'publish',
-          // 'schedule_at' => '2025-12-19 10:00:00',
+            'type'  => $type,
+            'wp_id' => $it->wp_id ?: null,
+
+            'title'   => $it->title ?: ($it->keyword ?: 'Sin título'),
+            'content' => $it->contenido_html,  // 👈 JSON Elementor guardado en BD
+
+            // ✅ importante para el plugin
+            'builder' => 'elementor',
+
+            // ✅ evita el “encajonado” por el header/theme
+            // si quieres header/footer: usa 'elementor_full_width'
+            'wp_page_template' => ($type === 'page') ? 'elementor_canvas' : '',
+
+            // status normal
+            'status' => 'publish',
+
+            // programar si quieres:
+            // 'schedule_at' => '2025-12-19 10:00:00',
         ];
 
-        $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($body === false) {
+            throw new \RuntimeException('No se pudo serializar payload JSON');
+        }
+
         $ts = time();
         $sig = hash_hmac('sha256', $ts . '.' . $body, $secret);
 
@@ -657,7 +671,7 @@ public function ContenidoGenerado(Request $request, string $IdDominio)
 
         // OK
         $it->estatus = (($json['status'] ?? '') === 'publish') ? 'publicado' : 'generado';
-        $it->wp_id = (int)($json['wp_id'] ?? 0) ?: $it->wp_id;
+        $it->wp_id   = (int)($json['wp_id'] ?? 0) ?: $it->wp_id;
         $it->wp_link = (string)($json['link'] ?? '');
         $it->save();
 
@@ -670,6 +684,7 @@ public function ContenidoGenerado(Request $request, string $IdDominio)
         return back()->with('error', 'Error publicando en WordPress: ' . $e->getMessage());
     }
 }
+
 
 
 public function programar(Request $request, $dominio, int $detalle): RedirectResponse
