@@ -15,7 +15,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    // ✅ En prod puede tardar. Sube timeout.
     public $timeout = 900;
     public $tries = 1;
 
@@ -74,7 +73,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
             $draftRaw = $this->deepseekText($apiKey, $model, $draftPrompt, maxTokens: 2200);
             $draft = $this->parseJsonStrict($draftRaw);
-            $draft = $this->sanitizeCopyForSeo($draft);
+            $draft = $this->sanitizeAndNormalizeCopy($draft);
             $this->validateCopySchema($draft);
 
             // ===========================================================
@@ -93,7 +92,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
                 $auditedRaw = $this->deepseekText($apiKey, $model, $auditPrompt, maxTokens: 2400);
                 $final = $this->parseJsonStrict($auditedRaw);
-                $final = $this->sanitizeCopyForSeo($final);
+                $final = $this->sanitizeAndNormalizeCopy($final);
                 $this->validateCopySchema($final);
             }
 
@@ -110,12 +109,12 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
                 $repairRaw = $this->deepseekText($apiKey, $model, $repairPrompt, maxTokens: 2400);
                 $final = $this->parseJsonStrict($repairRaw);
-                $final = $this->sanitizeCopyForSeo($final);
+                $final = $this->sanitizeAndNormalizeCopy($final);
                 $this->validateCopySchema($final);
             }
 
             // ===========================================================
-            // 4) Cargar template Elementor base + rellenar por IDs
+            // 4) Template Elementor + rellenar por IDs
             // ===========================================================
             $tpl = $this->loadElementorTemplateFromStorage();
             $filled = $this->fillElementorTemplate($tpl, $final);
@@ -192,7 +191,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     }
 
     // ===========================================================
-    // DeepSeek (OpenAI compatible)
+    // DeepSeek
     // ===========================================================
     private function deepseekText(string $apiKey, string $model, string $prompt, int $maxTokens = 1200): string
     {
@@ -209,7 +208,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 'messages' => [
                     ['role' => 'user', 'content' => $prompt],
                 ],
-                'temperature' => 0.85, // 👈 más diversidad
+                'temperature' => 0.85, // diversidad
                 'max_tokens'  => $maxTokens,
             ]);
 
@@ -293,7 +292,7 @@ Devuelve ESTE esquema EXACTO:
 
 Restricciones HTML:
 - En p_html/a_html SOLO usa <p>, <strong>, <br>.
-- NO uses listas <ul>/<li> aquí.
+- NO uses listas <ul>/<li>.
 PROMPT;
     }
 
@@ -322,12 +321,11 @@ REGLAS OBLIGATORIAS:
 - seo_title único (60-65 chars).
 - Cambia enfoque, promesa, lenguaje y estructura.
 - Features y FAQs totalmente distintas (sin reciclar frases).
+- Devuelve EXACTAMENTE 4 features y EXACTAMENTE 9 FAQs.
 - No “Introducción”, “Conclusión”, “¿Qué es…?”.
 - No testimonios reales.
 - No keyword stuffing.
 - HTML permitido: <p>, <strong>, <br>.
-
-Devuelve el JSON final.
 PROMPT;
     }
 
@@ -354,11 +352,10 @@ CHECKLIST OBLIGATORIA:
 - Solo 1 H1: hero_h1 (no <h1> en nada).
 - seo_title <= 65 caracteres, único.
 - Nada de keyword stuffing.
-- Features y FAQs: enfoque distinto y frases distintas.
+- Features: EXACTAMENTE 4.
+- FAQ: EXACTAMENTE 9.
 - Sin headings genéricos: Introducción/Conclusión/Qué es.
 - HTML permitido: <p>, <strong>, <br>.
-
-Devuelve el JSON final corregido.
 PROMPT;
     }
 
@@ -368,7 +365,6 @@ PROMPT;
     private function parseJsonStrict(string $raw): array
     {
         $raw = trim($raw);
-
         $raw = preg_replace('~^```(?:json)?\s*~i', '', $raw);
         $raw = preg_replace('~\s*```$~', '', $raw);
         $raw = trim($raw);
@@ -387,10 +383,14 @@ PROMPT;
     }
 
     // ===========================================================
-    // SEO/H1: sanitizar + validaciones
+    // SANITIZE + NORMALIZE (features=4, faq=9) + SEO
     // ===========================================================
-    private function sanitizeCopyForSeo(array $copy): array
+    private function sanitizeAndNormalizeCopy(array $copy): array
     {
+        // defaults para evitar notices
+        $copy['features'] = isset($copy['features']) && is_array($copy['features']) ? $copy['features'] : [];
+        $copy['faq']      = isset($copy['faq']) && is_array($copy['faq']) ? $copy['faq'] : [];
+
         // hero_h1: solo texto
         $copy['hero_h1'] = trim(strip_tags((string)($copy['hero_h1'] ?? '')));
         if ($copy['hero_h1'] === '') {
@@ -400,7 +400,6 @@ PROMPT;
         // seo_title: limpio + truncado
         $seo = trim(strip_tags((string)($copy['seo_title'] ?? '')));
         if ($seo === '') $seo = $copy['hero_h1'];
-
         if (mb_strlen($seo) > 65) {
             $seo = mb_substr($seo, 0, 65);
             $seo = rtrim($seo, " \t\n\r\0\x0B-–—|:");
@@ -421,27 +420,125 @@ PROMPT;
             $copy[$k] = $v;
         }
 
-        if (isset($copy['features']) && is_array($copy['features'])) {
-            foreach ($copy['features'] as $i => $f) {
-                $copy['features'][$i]['title'] = trim(strip_tags((string)($f['title'] ?? '')));
-                $p = (string)($f['p_html'] ?? '');
-                $p = $this->stripH1Tags($p);
-                $p = $this->keepAllowedInlineHtml($p);
-                $copy['features'][$i]['p_html'] = $p;
-            }
-        }
+        // normalizar features (4)
+        $copy['features'] = $this->normalizeFeatures($copy['features'], 4);
 
-        if (isset($copy['faq']) && is_array($copy['faq'])) {
-            foreach ($copy['faq'] as $i => $q) {
-                $copy['faq'][$i]['q'] = trim(strip_tags((string)($q['q'] ?? '')));
-                $a = (string)($q['a_html'] ?? '');
-                $a = $this->stripH1Tags($a);
-                $a = $this->keepAllowedInlineHtml($a);
-                $copy['faq'][$i]['a_html'] = $a;
-            }
-        }
+        // normalizar faq (9)
+        $copy['faq'] = $this->normalizeFaq($copy['faq'], 9);
 
         return $copy;
+    }
+
+    private function normalizeFeatures(array $features, int $need): array
+    {
+        $out = [];
+        foreach ($features as $f) {
+            if (!is_array($f)) continue;
+            $title = trim(strip_tags((string)($f['title'] ?? '')));
+            $p = (string)($f['p_html'] ?? '');
+            $p = $this->keepAllowedInlineHtml($this->stripH1Tags($p));
+            if ($title === '' && $p === '') continue;
+            $out[] = ['title' => $title, 'p_html' => $p];
+        }
+
+        // recorta
+        if (count($out) > $need) {
+            $out = array_slice($out, 0, $need);
+        }
+
+        // rellena
+        $fallbackTitles = [
+            "Enfoque a resultados",
+            "Proceso claro y rápido",
+            "Calidad y coherencia",
+            "Optimización SEO real",
+            "Soporte y seguimiento",
+            "Entrega lista para publicar",
+        ];
+
+        $i = 0;
+        while (count($out) < $need) {
+            $t = $fallbackTitles[$i % count($fallbackTitles)] . " para " . $this->shortKw();
+            $out[] = [
+                'title' => $t,
+                'p_html' => "<p><strong>Qué incluye:</strong> diagnóstico breve, propuesta alineada y ejecución sin rodeos para que tu {$this->shortKw()} avance con claridad.</p>",
+            ];
+            $i++;
+        }
+
+        return $out;
+    }
+
+    private function normalizeFaq(array $faq, int $need): array
+    {
+        $out = [];
+        foreach ($faq as $q) {
+            if (!is_array($q)) continue;
+            $qq = trim(strip_tags((string)($q['q'] ?? '')));
+            $aa = (string)($q['a_html'] ?? '');
+            $aa = $this->keepAllowedInlineHtml($this->stripH1Tags($aa));
+            if ($qq === '' && $aa === '') continue;
+            $out[] = ['q' => $qq, 'a_html' => $aa];
+        }
+
+        // recorta
+        if (count($out) > $need) {
+            $out = array_slice($out, 0, $need);
+        }
+
+        // rellena con FAQs fallback (distintas y SEO/CRO)
+        $templatesQ = [
+            "¿En cuánto tiempo se notan resultados con {kw}?",
+            "¿Qué incluye exactamente el servicio de {kw}?",
+            "¿Necesito tener web lista antes de contratar {kw}?",
+            "¿Cómo se define el plan y los entregables de {kw}?",
+            "¿Qué información tengo que aportar para empezar {kw}?",
+            "¿Se puede adaptar {kw} a mi sector o ciudad?",
+            "¿Cómo evitamos contenido duplicado con {kw}?",
+            "¿Qué diferencia a {kw} de una solución genérica?",
+            "¿Puedo publicar yo mismo o me lo dejáis listo?",
+            "¿Qué pasa si quiero cambios después de la entrega?",
+            "¿Trabajáis con objetivos (leads/ventas) o solo tráfico?",
+            "¿Se optimiza para móvil y velocidad?",
+        ];
+
+        $templatesA = [
+            "<p>Depende de tu punto de partida, pero lo normal es ver señales iniciales en <strong>2–4 semanas</strong> y mejoras más claras en <strong>6–12 semanas</strong>. Ajustamos prioridades para acelerar impacto.</p>",
+            "<p>Incluye planificación, redacción orientada a conversión, optimización SEO on-page y estructura lista para publicar. Si ya tienes material, lo reutilizamos sin repetir ni copiar.</p>",
+            "<p>No necesariamente. Podemos trabajar sobre una base mínima y dejarte el contenido y la estructura lista para implementar. Si ya hay web, adaptamos el copy al diseño existente.</p>",
+            "<p>Definimos un objetivo principal, un enfoque (beneficios, objeciones, proceso) y los entregables. Así el resultado no es “texto bonito”, sino una pieza diseñada para convertir.</p>",
+            "<p>Con 3 cosas arrancamos: tu oferta, tu público ideal y 2–3 competidores o referencias. Si no lo tienes claro, lo construimos contigo en un brief rápido.</p>",
+            "<p>Sí. Ajustamos el mensaje a tu sector, tono y zona si aplica. Además usamos variaciones semánticas para atacar búsquedas reales sin forzar la keyword.</p>",
+            "<p>Usamos una regla simple: cada pieza debe tener <strong>ángulo, estructura y ejemplos propios</strong>. Además comparamos contra lo ya generado para asegurar variedad.</p>",
+            "<p>Una solución genérica repite frases. Aquí se trabaja con intención, objeciones y diferenciadores reales para que el contenido tenga personalidad y performance.</p>",
+            "<p>Te lo dejamos listo. Puedes publicarlo tú o enviarlo directo a WordPress. El contenido se entrega con formato limpio y sin etiquetas problemáticas.</p>",
+            "<p>Se contempla una ronda de ajustes razonables. Si hay cambios grandes de alcance, lo convertimos en una mejora planificada para no romper coherencia.</p>",
+            "<p>Se orienta a objetivos: formularios, llamadas, reservas o ventas. El SEO es el canal; la conversión es el resultado.</p>",
+            "<p>Se redacta pensando en escaneo móvil (frases cortas, jerarquía clara) y se evita contenido pesado. La velocidad depende del theme/hosting, pero el copy no estorba.</p>",
+        ];
+
+        $idx = 0;
+        while (count($out) < $need) {
+            $q = str_replace('{kw}', $this->shortKw(), $templatesQ[$idx % count($templatesQ)]);
+            $a = $templatesA[$idx % count($templatesA)];
+            $out[] = ['q' => $q, 'a_html' => $a];
+            $idx++;
+        }
+
+        // último saneo de allowed html
+        foreach ($out as $i => $item) {
+            $out[$i]['q'] = trim(strip_tags((string)($item['q'] ?? '')));
+            $out[$i]['a_html'] = $this->keepAllowedInlineHtml($this->stripH1Tags((string)($item['a_html'] ?? '')));
+        }
+
+        return $out;
+    }
+
+    private function shortKw(): string
+    {
+        $kw = trim((string)$this->keyword);
+        if ($kw === '') return 'tu proyecto';
+        return mb_substr($kw, 0, 70);
     }
 
     private function stripH1Tags(string $html): string
@@ -491,6 +588,7 @@ PROMPT;
                 throw new \RuntimeException("JSON copy incompleto, falta: {$k}");
             }
         }
+
         if (!is_array($copy['features']) || count($copy['features']) !== 4) {
             throw new \RuntimeException('features debe tener 4 items');
         }
@@ -642,7 +740,7 @@ PROMPT;
         $set('5a85cb05', 'title', $copy['pack_h2']);
         $set('6ad00c97', 'editor', $copy['pack_p_html']);
 
-        // FEATURES
+        // FEATURES (4)
         $featureMap = [
             ['titleId' => '526367e6', 'pId' => '45af2625'],
             ['titleId' => '4666a6c0', 'pId' => '53b8710d'],
@@ -657,7 +755,7 @@ PROMPT;
         // FAQ title
         $set('6af89728', 'title', $copy['faq_title']);
 
-        // FAQ questions
+        // FAQ questions (accordion)
         $mutateWidget('19d18174', function (&$w) use ($copy) {
             if (!isset($w['settings']['items']) || !is_array($w['settings']['items'])) return;
             foreach ($w['settings']['items'] as $i => &$it) {
@@ -666,7 +764,7 @@ PROMPT;
             }
         });
 
-        // FAQ answers
+        // FAQ answers (9)
         $faqAnswerIds = ['4187d584','289604f1','5f11dfaa','68e67f41','5ba521b7','3012a20a','267fd373','4091b80d','7d07103e'];
         foreach ($faqAnswerIds as $i => $ansId) {
             $set($ansId, 'editor', (string)$copy['faq'][$i]['a_html']);
