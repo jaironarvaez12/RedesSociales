@@ -62,55 +62,99 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $noRepetirCorpus = implode("\n\n----\n\n", array_filter($usedCorpus));
 
             // ===========================================================
-            // 1) REDACTOR (JSON)
+            // 1-3) Generación con variedad real + auditor SIEMPRE + retries
             // ===========================================================
-            $draftPrompt = $this->promptRedactorJson(
-                $this->tipo,
-                $this->keyword,
-                $noRepetirTitles,
-                $noRepetirCorpus
-            );
+            $final = null;
+            $attempts = 3;
 
-            $draftRaw = $this->deepseekText($apiKey, $model, $draftPrompt, maxTokens: 2200);
-            $draft = $this->parseJsonStrict($draftRaw);
-            $draft = $this->sanitizeAndNormalizeCopy($draft);
-            $this->validateCopySchema($draft);
+            for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+                $brief = $this->creativeBrief($this->keyword);
 
-            // ===========================================================
-            // 2) AUDITOR anti-repetición (solo si hace falta)
-            // ===========================================================
-            $final = $draft;
+                // 1) REDACTOR (JSON)
+                $draftPrompt = $this->promptRedactorJson(
+                    $this->tipo,
+                    $this->keyword,
+                    $noRepetirTitles,
+                    $noRepetirCorpus,
+                    $brief
+                );
 
-            if ($this->isTooSimilarToAnyPrevious($draft, $usedTitles, $usedCorpus)) {
+                $draftRaw = $this->deepseekText(
+                    $apiKey,
+                    $model,
+                    $draftPrompt,
+                    maxTokens: 2300,
+                    temperature: 0.95,
+                    topP: 0.92
+                );
+
+                $draft = $this->parseJsonStrict($draftRaw);
+                $draft = $this->sanitizeAndNormalizeCopy($draft);
+                $this->validateCopySchema($draft);
+
+                // 2) AUDITOR (SIEMPRE) => reescribe para variar mucho
                 $auditPrompt = $this->promptAuditorJson(
                     $this->tipo,
                     $this->keyword,
                     $draft,
                     $noRepetirTitles,
-                    $noRepetirCorpus
+                    $noRepetirCorpus,
+                    $brief
                 );
 
-                $auditedRaw = $this->deepseekText($apiKey, $model, $auditPrompt, maxTokens: 2400);
-                $final = $this->parseJsonStrict($auditedRaw);
-                $final = $this->sanitizeAndNormalizeCopy($final);
-                $this->validateCopySchema($final);
+                $auditedRaw = $this->deepseekText(
+                    $apiKey,
+                    $model,
+                    $auditPrompt,
+                    maxTokens: 2500,
+                    temperature: 0.92,
+                    topP: 0.90
+                );
+
+                $candidate = $this->parseJsonStrict($auditedRaw);
+                $candidate = $this->sanitizeAndNormalizeCopy($candidate);
+                $this->validateCopySchema($candidate);
+
+                // 3) REPAIR si viola SEO/H1 o sigue similar
+                if ($this->violatesSeoHardRules($candidate) || $this->isTooSimilarToAnyPrevious($candidate, $usedTitles, $usedCorpus)) {
+                    $repairPrompt = $this->promptRepairJson(
+                        $this->keyword,
+                        $candidate,
+                        $noRepetirTitles,
+                        $noRepetirCorpus,
+                        $brief
+                    );
+
+                    $repairRaw = $this->deepseekText(
+                        $apiKey,
+                        $model,
+                        $repairPrompt,
+                        maxTokens: 2600,
+                        temperature: 0.90,
+                        topP: 0.90
+                    );
+
+                    $candidate = $this->parseJsonStrict($repairRaw);
+                    $candidate = $this->sanitizeAndNormalizeCopy($candidate);
+                    $this->validateCopySchema($candidate);
+                }
+
+                $final = $candidate;
+
+                // Si ya quedó bien (no similar y sin violaciones) => listo
+                if (!$this->isTooSimilarToAnyPrevious($candidate, $usedTitles, $usedCorpus) && !$this->violatesSeoHardRules($candidate)) {
+                    break;
+                }
+
+                // Si sigue parecido, lo agregamos al historial para el siguiente intento
+                $usedTitles[] = (string)($candidate['seo_title'] ?? $candidate['hero_h1'] ?? '');
+                $usedCorpus[] = $this->copyTextFromArray($candidate);
+                $noRepetirTitles = implode(' | ', array_filter($usedTitles));
+                $noRepetirCorpus = implode("\n\n----\n\n", array_filter($usedCorpus));
             }
 
-            // ===========================================================
-            // 3) REPAIR (si viola SEO/H1 o sigue similar)
-            // ===========================================================
-            if ($this->violatesSeoHardRules($final) || $this->isTooSimilarToAnyPrevious($final, $usedTitles, $usedCorpus)) {
-                $repairPrompt = $this->promptRepairJson(
-                    $this->keyword,
-                    $final,
-                    $noRepetirTitles,
-                    $noRepetirCorpus
-                );
-
-                $repairRaw = $this->deepseekText($apiKey, $model, $repairPrompt, maxTokens: 2400);
-                $final = $this->parseJsonStrict($repairRaw);
-                $final = $this->sanitizeAndNormalizeCopy($final);
-                $this->validateCopySchema($final);
+            if (!is_array($final)) {
+                throw new \RuntimeException('No se pudo generar contenido final');
             }
 
             // ===========================================================
@@ -193,8 +237,18 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     // ===========================================================
     // DeepSeek
     // ===========================================================
-    private function deepseekText(string $apiKey, string $model, string $prompt, int $maxTokens = 1200): string
+    private function deepseekText(
+        string $apiKey,
+        string $model,
+        string $prompt,
+        int $maxTokens = 1200,
+        float $temperature = 0.90,
+        float $topP = 0.92
+    ): string
     {
+        // “Nonce” para romper eco/cache y forzar variación
+        $nonce = 'nonce:' . Str::uuid()->toString();
+
         $resp = Http::withHeaders([
                 'Authorization' => 'Bearer ' . $apiKey,
                 'Accept' => 'application/json',
@@ -206,9 +260,14 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             ->post('https://api.deepseek.com/v1/chat/completions', [
                 'model' => $model,
                 'messages' => [
-                    ['role' => 'user', 'content' => $prompt],
+                    ['role' => 'system', 'content' => 'Eres un redactor SEO/CRO. Devuelves SOLO JSON válido. No escribes markdown ni explicaciones.'],
+                    ['role' => 'user', 'content' => $prompt . "\n\n" . $nonce],
                 ],
-                'temperature' => 0.85, // diversidad
+                'temperature' => $temperature,
+                'top_p' => $topP,
+                // Si tu DeepSeek no acepta estos campos, bórralos.
+                'presence_penalty' => 1.1,
+                'frequency_penalty' => 0.6,
                 'max_tokens'  => $maxTokens,
             ]);
 
@@ -227,23 +286,83 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     }
 
     // ===========================================================
+    // BRIEF aleatorio para forzar variedad real (sin cambiar estructura)
+    // ===========================================================
+    private function creativeBrief(string $keyword): array
+    {
+        $angles = [
+            "Rapidez y ejecución (plazos claros, entrega sin vueltas)",
+            "Calidad premium (consistencia, tono de marca, precisión)",
+            "Orientado a leads (CTA, objeciones, conversión)",
+            "Personalización total (sector/ciudad/propuesta única)",
+            "Proceso y metodología (pasos, validación, control)",
+            "Diferenciación frente a competidores (propuesta y posicionamiento)",
+            "Optimización SEO natural (semántica, intención, sin stuffing)",
+            "Claridad del mensaje (menos ruido, más foco)",
+            "Escalabilidad (reutilizable, fácil de publicar, ordenado)",
+            "Confianza sin claims falsos (transparencia, límites, expectativas)",
+            "Experiencia de usuario (escaneable, móvil, comprensión rápida)",
+            "Estrategia + copy (no solo texto: decisión del enfoque)",
+        ];
+        $tones = [
+            "Profesional directo",
+            "Cercano y humano",
+            "Premium sobrio",
+            "Enérgico y comercial",
+            "Técnico pero simple",
+        ];
+        $ctas = [
+            "Acción inmediata (Reserva/Agenda)",
+            "Orientado a consulta (Hablemos / Te asesoramos)",
+            "Orientado a precio/plan (Pide presupuesto)",
+            "Orientado a diagnóstico (Solicita revisión rápida)",
+        ];
+        $audiences = [
+            "Pymes y autónomos",
+            "Negocios locales",
+            "Ecommerce y servicios",
+            "Marcas en crecimiento",
+            "Profesionales independientes",
+        ];
+
+        return [
+            'angle' => $angles[random_int(0, count($angles) - 1)],
+            'tone' => $tones[random_int(0, count($tones) - 1)],
+            'cta' => $ctas[random_int(0, count($ctas) - 1)],
+            'audience' => $audiences[random_int(0, count($audiences) - 1)],
+        ];
+    }
+
+    // ===========================================================
     // PROMPTS
     // ===========================================================
-    private function promptRedactorJson(string $tipo, string $keyword, string $noRepetirTitles, string $noRepetirCorpus): string
+    private function promptRedactorJson(string $tipo, string $keyword, string $noRepetirTitles, string $noRepetirCorpus, array $brief): string
     {
+        $angle = (string)($brief['angle'] ?? '');
+        $tone  = (string)($brief['tone'] ?? '');
+        $cta   = (string)($brief['cta'] ?? '');
+        $aud   = (string)($brief['audience'] ?? '');
+
         return <<<PROMPT
 Devuelve SOLO JSON válido (sin markdown, sin explicación, sin texto fuera del JSON).
 
 OBJETIVO:
-Crear copy para una landing (Elementor) muy diferente a las anteriores aunque la keyword sea la misma.
+Crear copy para una landing (Elementor) MUY diferente a las anteriores aunque la keyword sea la misma.
+IMPORTANTE: Mantén EXACTAMENTE el mismo ESQUEMA/keys del JSON (estructura fija), pero el CONTENIDO (títulos, enfoque, frases) debe variar MUCHO en cada ejecución.
 
 Keyword: {$keyword}
 Tipo: {$tipo}
 
+BRIEF DE VARIACIÓN (OBLIGATORIO):
+- Ángulo principal: {$angle}
+- Tono: {$tone}
+- Público: {$aud}
+- Estilo CTA: {$cta}
+
 Títulos ya usados (NO repetir ni muy similares):
 {$noRepetirTitles}
 
-Textos anteriores (NO repetir frases ni estructura, evita similitud):
+Textos anteriores (NO repetir frases ni subtemas; evita similitud):
 {$noRepetirCorpus}
 
 REGLAS SEO (obligatorias):
@@ -254,6 +373,11 @@ REGLAS SEO (obligatorias):
 - No uses “Introducción”, “Conclusión”, “¿Qué es…?”.
 - No testimonios reales ni casos de éxito.
 - Copy escaneable y orientado a conversión.
+
+REGLAS DE ORIGINALIDAD (obligatorias):
+- No copies frases de lo anterior. Reescribe con otro ángulo y otras palabras.
+- Cambia los títulos: hero_h1, kit_h1, pack_h2, faq_title, final_cta_h3 deben ser nuevos y con promesa distinta.
+- Features y FAQs deben ser diferentes: cubre objeciones distintas (precio, plazos, personalización, proceso, entregables, etc.) según el ángulo.
 
 Devuelve ESTE esquema EXACTO:
 {
@@ -296,9 +420,13 @@ Restricciones HTML:
 PROMPT;
     }
 
-    private function promptAuditorJson(string $tipo, string $keyword, array $draft, string $noRepetirTitles, string $noRepetirCorpus): string
+    private function promptAuditorJson(string $tipo, string $keyword, array $draft, string $noRepetirTitles, string $noRepetirCorpus, array $brief): string
     {
         $draftShort = mb_substr(json_encode($draft, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), 0, 6500);
+
+        $angle = (string)($brief['angle'] ?? '');
+        $tone  = (string)($brief['tone'] ?? '');
+        $cta   = (string)($brief['cta'] ?? '');
 
         return <<<PROMPT
 Eres un editor SEO senior y CRO. Reescribe el JSON para que sea MUY DIFERENTE a los contenidos anteriores y NO repita frases/ángulos.
@@ -306,6 +434,11 @@ Eres un editor SEO senior y CRO. Reescribe el JSON para que sea MUY DIFERENTE a 
 Devuelve SOLO JSON válido (mismo esquema, mismas keys).
 Keyword: {$keyword}
 Tipo: {$tipo}
+
+BRIEF OBLIGATORIO:
+- Ángulo: {$angle}
+- Tono: {$tone}
+- Estilo CTA: {$cta}
 
 Títulos ya usados (NO repetir ni muy similares):
 {$noRepetirTitles}
@@ -319,7 +452,7 @@ BORRADOR A REESCRIBIR:
 REGLAS OBLIGATORIAS:
 - SOLO 1 H1: solo "hero_h1" (no escribas <h1> en ningún campo).
 - seo_title único (60-65 chars).
-- Cambia enfoque, promesa, lenguaje y estructura.
+- Mantén la estructura del JSON, pero reescribe TODO el contenido con otro enfoque y otras frases.
 - Features y FAQs totalmente distintas (sin reciclar frases).
 - Devuelve EXACTAMENTE 4 features y EXACTAMENTE 9 FAQs.
 - No “Introducción”, “Conclusión”, “¿Qué es…?”.
@@ -329,15 +462,22 @@ REGLAS OBLIGATORIAS:
 PROMPT;
     }
 
-    private function promptRepairJson(string $keyword, array $json, string $noRepetirTitles, string $noRepetirCorpus): string
+    private function promptRepairJson(string $keyword, array $json, string $noRepetirTitles, string $noRepetirCorpus, array $brief): string
     {
         $short = mb_substr(json_encode($json, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), 0, 6500);
+
+        $angle = (string)($brief['angle'] ?? '');
+        $tone  = (string)($brief['tone'] ?? '');
 
         return <<<PROMPT
 Corrige este JSON para que cumpla SEO, NO tenga <h1> en ningún campo y sea totalmente distinto a los anteriores.
 
 Devuelve SOLO JSON válido con el MISMO esquema y keys.
 Keyword: {$keyword}
+
+BRIEF:
+- Ángulo: {$angle}
+- Tono: {$tone}
 
 Títulos ya usados (NO repetir ni muy similares):
 {$noRepetirTitles}
@@ -420,11 +560,9 @@ PROMPT;
             $copy[$k] = $v;
         }
 
-        // normalizar features (4)
+        // normalizar features (4) y faq (9) con fallbacks variables
         $copy['features'] = $this->normalizeFeatures($copy['features'], 4);
-
-        // normalizar faq (9)
-        $copy['faq'] = $this->normalizeFaq($copy['faq'], 9);
+        $copy['faq']      = $this->normalizeFaq($copy['faq'], 9);
 
         return $copy;
     }
@@ -441,29 +579,29 @@ PROMPT;
             $out[] = ['title' => $title, 'p_html' => $p];
         }
 
-        // recorta
-        if (count($out) > $need) {
-            $out = array_slice($out, 0, $need);
-        }
+        if (count($out) > $need) $out = array_slice($out, 0, $need);
 
-        // rellena
+        // Fallbacks variables (no fijos)
         $fallbackTitles = [
-            "Enfoque a resultados",
-            "Proceso claro y rápido",
-            "Calidad y coherencia",
-            "Optimización SEO real",
-            "Soporte y seguimiento",
-            "Entrega lista para publicar",
+            "Plan a medida",
+            "Ejecución sin fricción",
+            "Mensaje con intención",
+            "Diferenciación real",
+            "Optimización orientada a leads",
+            "Entrega lista para implementar",
+            "Iteración y mejora",
+            "Consistencia de marca",
+            "Claridad en la propuesta",
+            "Alineación con el usuario",
         ];
 
-        $i = 0;
         while (count($out) < $need) {
-            $t = $fallbackTitles[$i % count($fallbackTitles)] . " para " . $this->shortKw();
+            $pick = $fallbackTitles[random_int(0, count($fallbackTitles) - 1)];
+            $t = $pick . " para " . $this->shortKw();
             $out[] = [
                 'title' => $t,
-                'p_html' => "<p><strong>Qué incluye:</strong> diagnóstico breve, propuesta alineada y ejecución sin rodeos para que tu {$this->shortKw()} avance con claridad.</p>",
+                'p_html' => "<p><strong>Qué aporta:</strong> una mejora concreta en claridad, enfoque y conversión, con copy adaptado para {$this->shortKw()} sin repetir fórmulas.</p>",
             ];
-            $i++;
         }
 
         return $out;
@@ -481,12 +619,9 @@ PROMPT;
             $out[] = ['q' => $qq, 'a_html' => $aa];
         }
 
-        // recorta
-        if (count($out) > $need) {
-            $out = array_slice($out, 0, $need);
-        }
+        if (count($out) > $need) $out = array_slice($out, 0, $need);
 
-        // rellena con FAQs fallback (distintas y SEO/CRO)
+        // Fallbacks variables (random) para no repetir siempre igual
         $templatesQ = [
             "¿En cuánto tiempo se notan resultados con {kw}?",
             "¿Qué incluye exactamente el servicio de {kw}?",
@@ -500,6 +635,9 @@ PROMPT;
             "¿Qué pasa si quiero cambios después de la entrega?",
             "¿Trabajáis con objetivos (leads/ventas) o solo tráfico?",
             "¿Se optimiza para móvil y velocidad?",
+            "¿Cómo se decide el enfoque del mensaje en {kw}?",
+            "¿Hay una metodología para reducir objeciones en {kw}?",
+            "¿Qué no incluye {kw} para evitar falsas expectativas?",
         ];
 
         $templatesA = [
@@ -515,20 +653,23 @@ PROMPT;
             "<p>Se contempla una ronda de ajustes razonables. Si hay cambios grandes de alcance, lo convertimos en una mejora planificada para no romper coherencia.</p>",
             "<p>Se orienta a objetivos: formularios, llamadas, reservas o ventas. El SEO es el canal; la conversión es el resultado.</p>",
             "<p>Se redacta pensando en escaneo móvil (frases cortas, jerarquía clara) y se evita contenido pesado. La velocidad depende del theme/hosting, pero el copy no estorba.</p>",
+            "<p>El enfoque se define por intención de búsqueda, objeciones del usuario y propuesta única. Si falta info, usamos un brief corto para concretarlo.</p>",
+            "<p>Sí: priorizamos claridad, promesa creíble, pruebas internas (sin testimonios falsos) y un CTA coherente para reducir dudas.</p>",
+            "<p>Para no crear expectativas irreales, dejamos claro el alcance, tiempos y entregables. Si necesitas algo extra, se planifica como mejora.</p>",
         ];
 
-        $idx = 0;
         while (count($out) < $need) {
-            $q = str_replace('{kw}', $this->shortKw(), $templatesQ[$idx % count($templatesQ)]);
-            $a = $templatesA[$idx % count($templatesA)];
-            $out[] = ['q' => $q, 'a_html' => $a];
-            $idx++;
+            $qTpl = $templatesQ[random_int(0, count($templatesQ) - 1)];
+            $aTpl = $templatesA[random_int(0, count($templatesA) - 1)];
+            $q = str_replace('{kw}', $this->shortKw(), $qTpl);
+            $out[] = ['q' => $q, 'a_html' => $aTpl];
         }
 
-        // último saneo de allowed html
         foreach ($out as $i => $item) {
             $out[$i]['q'] = trim(strip_tags((string)($item['q'] ?? '')));
-            $out[$i]['a_html'] = $this->keepAllowedInlineHtml($this->stripH1Tags((string)($item['a_html'] ?? '')));
+            $out[$i]['a_html'] = $this->keepAllowedInlineHtml(
+                $this->stripH1Tags((string)($item['a_html'] ?? ''))
+            );
         }
 
         return $out;
@@ -611,7 +752,8 @@ PROMPT;
         if ($title !== '') {
             foreach ($usedTitles as $t) {
                 $t2 = mb_strtolower(trim((string)$t));
-                if ($t2 !== '' && $this->jaccardBigrams($title, $t2) >= 0.72) {
+                // umbral un poquito más sensible para disparar reintentos
+                if ($t2 !== '' && $this->jaccardBigrams($title, $t2) >= 0.65) {
                     return true;
                 }
             }
@@ -621,7 +763,7 @@ PROMPT;
         foreach ($usedCorpus as $corp) {
             if ($corp === '') continue;
             $sim = $this->jaccardBigrams($text, $corp);
-            if ($sim >= 0.55) return true;
+            if ($sim >= 0.50) return true;
         }
 
         return false;
