@@ -14,8 +14,11 @@ use Illuminate\Support\Str;
 class GenerarContenidoKeywordJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
-    public $timeout = 300;   // 5 min (ajusta según tu caso)
-    public $tries = 1;       // para que no se duplique mientras pruebas
+
+    // ✅ En prod 2 llamadas + red puede pasar 5 min. Sube.
+    public $timeout = 900;
+    public $tries = 1;
+
     public function __construct(
         public string $idDominio,
         public string $idDominioContenido,
@@ -25,9 +28,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
     public function handle(): void
     {
-        // ✅ SIEMPRE genera un registro nuevo (historial)
         $registro = Dominios_Contenido_DetallesModel::create([
-            // NO enviar id_dominio_contenido_detalle (AUTO_INCREMENT)
             'id_dominio_contenido' => (int)$this->idDominioContenido,
             'id_dominio' => (int)$this->idDominio,
             'tipo' => $this->tipo,
@@ -37,10 +38,13 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         ]);
 
         try {
-            $apiKey = env('DEEPSEEK_API_KEY');
-            $model  = env('DEEPSEEK_MODEL', 'deepseek-chat');
+            $apiKey = (string) env('DEEPSEEK_API_KEY', '');
+            $model  = (string) env('DEEPSEEK_MODEL', 'deepseek-chat');
 
-            // ✅ Títulos anteriores para NO repetir (limitado para no inflar el prompt)
+            if ($apiKey === '') {
+                throw new \RuntimeException('DEEPSEEK_API_KEY no configurado');
+            }
+
             $existentes = Dominios_Contenido_DetallesModel::where('id_dominio_contenido', (int)$this->idDominioContenido)
                 ->whereNotNull('title')
                 ->orderByDesc('id_dominio_contenido_detalle')
@@ -50,13 +54,28 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
             $noRepetir = implode(' | ', array_filter($existentes));
 
-            // 1) Redactor -> HTML borrador
+            // 1) Redactor: genera ya con estructura Nictorys
             $draftPrompt = $this->promptRedactor($this->tipo, $this->keyword, $noRepetir);
-            $draftHtml   = $this->deepseekText($apiKey, $model, $draftPrompt);
+            $draftHtml   = $this->deepseekText($apiKey, $model, $draftPrompt, maxTokens: 4500);
 
-            // 2) Auditor -> HTML final mejorado
-            $auditPrompt = $this->promptAuditorHtml($this->tipo, $this->keyword, $draftHtml, $noRepetir);
-            $finalHtml   = $this->deepseekText($apiKey, $model, $auditPrompt);
+            $draftHtml = $this->ensureNictorysWrappers($draftHtml);
+
+            // 2) Auditor SOLO si hace falta (ahorra tiempo y evita kill)
+            $finalHtml = $draftHtml;
+
+            if (!$this->looksLikeNictorys($draftHtml)) {
+                $draftShort  = mb_substr($draftHtml, 0, 12000);
+                $auditPrompt = $this->promptAuditorHtml($this->tipo, $this->keyword, $draftShort, $noRepetir);
+                $finalHtml   = $this->deepseekText($apiKey, $model, $auditPrompt, maxTokens: 4500);
+                $finalHtml   = $this->ensureNictorysWrappers($finalHtml);
+            }
+
+            // 3) Repair pass si todavía no cumple
+            if (!$this->looksLikeNictorys($finalHtml)) {
+                $repairPrompt = $this->promptRepairNictorys($this->keyword, mb_substr($finalHtml, 0, 14000));
+                $finalHtml = $this->deepseekText($apiKey, $model, $repairPrompt, maxTokens: 4500);
+                $finalHtml = $this->ensureNictorysWrappers($finalHtml);
+            }
 
             // Title desde H1
             $title = null;
@@ -64,11 +83,9 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 $title = trim(strip_tags($m[1]));
             }
 
-            // Slug único (si el title se repite igual, al menos el slug no choca)
             $slugBase = $title ? Str::slug($title) : Str::slug($this->keyword);
             $slug = $slugBase . '-' . $registro->id_dominio_contenido_detalle;
 
-            // Actualiza el registro con resultados
             $registro->update([
                 'title' => $title,
                 'slug' => $slug,
@@ -88,9 +105,9 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     }
 
     /**
-     * Llamada a DeepSeek (OpenAI-compatible) y extracción de texto.
+     * DeepSeek (OpenAI compatible)
      */
-    private function deepseekText(string $apiKey, string $model, string $prompt): string
+    private function deepseekText(string $apiKey, string $model, string $prompt, int $maxTokens = 3500): string
     {
         $resp = Http::withHeaders([
                 'Authorization' => 'Bearer ' . $apiKey,
@@ -98,15 +115,15 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 'Content-Type' => 'application/json',
             ])
             ->connectTimeout(15)
-            ->timeout(150)
-            ->retry(1, 700)
+            ->timeout(160)     // no lo dejes gigante
+            ->retry(0, 0)      // en generación es mejor no alargar con retries
             ->post('https://api.deepseek.com/v1/chat/completions', [
                 'model' => $model,
                 'messages' => [
                     ['role' => 'user', 'content' => $prompt],
                 ],
-                // opcional:
-                // 'temperature' => 0.8,
+                'temperature' => 0.7,
+                'max_tokens'  => $maxTokens,
             ]);
 
         if (!$resp->successful()) {
@@ -114,7 +131,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         }
 
         $data = $resp->json();
-
         $text = trim((string)($data['choices'][0]['message']['content'] ?? ''));
 
         if ($text === '') {
@@ -125,16 +141,82 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     }
 
     /**
-     * Redactor: genera un borrador HTML (sin repetir títulos previos).
+     * Fuerza wrappers necesarios para que el CSS del template funcione mejor:
+     * - <div class="nictorys-content">
+     * - <div class="page-wrapper">
      */
- private function promptRedactor(string $tipo, string $keyword, string $noRepetir): string
-{
-    $base = "Devuelve SOLO HTML válido.
+    private function ensureNictorysWrappers(string $html): string
+    {
+        $html = trim($html);
+
+        if (!str_contains($html, 'nictorys-content')) {
+            $html = '<div class="nictorys-content">' . $html . '</div>';
+        }
+
+        // si ya trae page-wrapper, no lo dupliques
+        if (!str_contains($html, 'page-wrapper')) {
+            // mete page-wrapper justo dentro del nictorys-content
+            $html = preg_replace(
+                '~<div class="nictorys-content">\s*~i',
+                '<div class="nictorys-content"><div class="page-wrapper">',
+                $html,
+                1
+            );
+            // cierra page-wrapper antes del cierre final
+            $html = preg_replace(
+                '~</div>\s*$~',
+                '</div></div>',
+                $html,
+                1
+            );
+        }
+
+        return $html;
+    }
+
+    private function looksLikeNictorys(string $html): bool
+    {
+        if ($html === '') return false;
+
+        // Must-have sections (mínimo)
+        $must = [
+            'nictorys-content',
+            'hero-slider hero-style-2',
+            'features-section-s2',
+            'about-us-section-s2',
+            'services-section-s2',
+            'contact-section',
+            'cta-section-s2',
+            'latest-projects-section-s2',
+            'why-choose-us-section',
+            'team-section',
+            'testimonials-section',
+            'blog-section',
+        ];
+
+        foreach ($must as $n) {
+            if (!str_contains($html, $n)) return false;
+        }
+
+        // 1 solo h1
+        preg_match_all('~<h1\b~i', $html, $m);
+        if (count($m[0] ?? []) !== 1) return false;
+
+        // no scripts/styles/links
+        if (preg_match('~<(script|style|link)\b~i', $html)) return false;
+
+        return true;
+    }
+
+    private function promptRedactor(string $tipo, string $keyword, string $noRepetir): string
+    {
+        $base = "Devuelve SOLO HTML válido.
 NO incluyas <!DOCTYPE>, <html>, <head>, <meta>, <title>, <body>.
 NO uses markdown. NO expliques nada.
 NO uses headings: Introducción, Conclusión, ¿Qué es...?
 NO uses casos de éxito ni testimonios.
 NO uses el texto 'guía práctica' ni variantes.
+NO uses Lorem ipsum.
 
 Títulos ya usados (NO repetir ni hacer muy similares):
 {$noRepetir}
@@ -142,12 +224,11 @@ Títulos ya usados (NO repetir ni hacer muy similares):
 REGLA CLAVE:
 Aunque la keyword sea la misma, crea una versión totalmente distinta:
 - título diferente
-- H2/H3 diferentes
 - orden distinto
-- ejemplos/argumentos diferentes
+- argumentos y ejemplos distintos
 - evita frases tipo: 'en este artículo veremos...'.";
 
-    return "{$base}
+        return "{$base}
 
 Keyword objetivo: {$keyword}
 Tipo: {$tipo}
@@ -156,77 +237,108 @@ Tipo: {$tipo}
 
 INSTRUCCIONES EXTRA:
 - El <h1> debe ir dentro del HERO (hero-slider).
-- Mantén la estructura HTML de cada sección como la plantilla (containers, rows, cols, grids).
-- CTAs: al inicio (hero), mitad (cta-section-s2) y cierre (última sección).
-- FAQ: inclúyela dentro de la sección que mejor encaje (por ejemplo dentro de about o why-choose-us) usando <h3> + <ul><li> o <div>.
+- El HTML final debe incluir además: <div class=\"page-wrapper\"> dentro de nictorys-content (si no lo pones, igual lo forzaremos).
+- Enlaces siempre href=\"#\".
+- Imágenes siempre assets/images/... (WordPress plugin reescribe).
 
 Devuelve SOLO el HTML.";
-}
+    }
 
     /**
-     * Auditor: mejora el borrador y devuelve HTML final.
+     * Auditor corto (NO repite el contrato completo para no inflar contexto)
      */
-  private function promptAuditorHtml(string $tipo, string $keyword, string $draftHtml, string $noRepetir): string
-{
-    return "Eres un consultor SEO senior. Tu tarea es AUDITAR y MEJORAR el contenido y devolver UNA VERSIÓN FINAL.
+    private function promptAuditorHtml(string $tipo, string $keyword, string $draftHtml, string $noRepetir): string
+    {
+        return "Eres un consultor SEO senior. Reescribe el HTML para mejor conversión y claridad, manteniendo EXACTAMENTE la maqueta Nictorys.
 
-Devuelve SOLO HTML válido.
-NO incluyas <!DOCTYPE>, <html>, <head>, <meta>, <title>, <body>.
-NO uses markdown.
-NO expliques nada.
-No headings: Introducción, Conclusión, ¿Qué es...?
+Devuelve SOLO HTML.
+No incluyas <!DOCTYPE>, <html>, <head>, <meta>, <title>, <body>.
+No uses markdown. No expliques nada.
+No headings genéricos: Introducción, Conclusión, ¿Qué es...?
 No casos de éxito ni testimonios reales.
 No 'guía práctica' ni variantes.
+No <script>, <style>, <link>, header, footer.
 
 Títulos ya usados (NO repetir ni hacer muy similares):
 {$noRepetir}
 
-DEBES RESPETAR este contrato de estructura/clases y el wrapper:
-" . $this->nictorysContract() . "
+REGLAS OBLIGATORIAS:
+- Debe estar envuelto en <div class=\"nictorys-content\"><div class=\"page-wrapper\"> ... </div></div>
+- Debe contener estas secciones en orden:
+  hero-slider hero-style-2 (1 solo <h1> dentro del hero)
+  features-section-s2
+  about-us-section-s2
+  services-section-s2 (id services)
+  contact-section (id contact)
+  cta-section-s2
+  latest-projects-section-s2
+  why-choose-us-section
+  team-section
+  testimonials-section (como Garantías/Compromisos, sin testimonios)
+  blog-section
+- Imágenes: assets/images/...
+- Enlaces: href=\"#\"
 
-Objetivo:
-- Mejorar intención de búsqueda y conversión
-- Evitar repetición y relleno
-- H2/H3 más específicos
-- CTA más claro
-- Mantener 1 solo <h1> (en hero)
-
+Keyword: {$keyword}
 Tipo: {$tipo}
+
+HTML a mejorar:
+{$draftHtml}";
+    }
+
+    private function promptRepairNictorys(string $keyword, string $html): string
+    {
+        return "Convierte este HTML a la plantilla Nictorys obligatoria.
+
+Devuelve SOLO HTML.
+Debe iniciar con:
+<div class=\"nictorys-content\"><div class=\"page-wrapper\">
+y cerrar ambos div al final.
+No incluyas scripts/styles/links ni header/footer.
+
+Debe incluir estas secciones EN ORDEN:
+hero-slider hero-style-2 (con 1 solo <h1>)
+features-section-s2
+about-us-section-s2
+services-section-s2 (id services)
+contact-section (id contact)
+cta-section-s2
+latest-projects-section-s2
+why-choose-us-section
+team-section
+testimonials-section (Garantías)
+blog-section
+
 Keyword: {$keyword}
 
-HTML A MEJORAR (reescribe y devuelve HTML final):
-{$draftHtml}";
-}
-
-
-
-
-
-
+HTML:
+{$html}";
+    }
 
     private function nictorysContract(): string
-{
-    return <<<TXT
-DEVUELVE SOLO HTML (contenido del post/page). NO incluyas <!DOCTYPE>, <html>, <head>, <body>, <script>, <link>, <style>, header, footer.
+    {
+        return <<<TXT
+DEVUELVE SOLO HTML (contenido). NO incluyas <!DOCTYPE>, <html>, <head>, <body>, <script>, <link>, <style>, header, footer.
 
 OBLIGATORIO: envuelve TODO en:
-<div class="nictorys-content"> ... </div>
+<div class="nictorys-content"><div class="page-wrapper"> ... </div></div>
 
 Usa EXACTAMENTE estas secciones y clases (en este orden):
 1) <section class="hero-slider hero-style-2"> ... (AQUÍ va el ÚNICO <h1>)
-   - Debe incluir .swiper-container, .swiper-wrapper, .swiper-slide, y dentro .slide-inner.slide-bg-image con data-background="assets/images/slider/slide-1.jpg"
+   - Debe incluir .swiper-container, .swiper-wrapper, .swiper-slide
+   - Dentro: .slide-inner.slide-bg-image con data-background="assets/images/slider/slide-1.jpg"
    - Incluye 2 CTAs con clases theme-btn y theme-btn-s2
 
 2) <section class="features-section-s2"> ... (4 features .grid)
 
 3) <section class="about-us-section-s2 section-padding p-t-0"> ...
-   - Incluye .img-holder y .about-details, y lista <ul><li>...
+   - Incluye .img-holder y .about-details + <ul><li>...
 
 4) <section class="services-section-s2 section-padding" id="services"> ...
    - 6 cards .grid con .img-holder + .details + icon <i class="fi ..."></i>
 
 5) <section class="contact-section section-padding" id="contact"> ...
-   - Mantén estructura de formulario similar (inputs + textarea), action "#"
+   - Form similar (inputs + textarea) action="#"
 
 6) <section class="cta-section-s2"> ... (CTA fuerte)
 
@@ -239,20 +351,17 @@ Usa EXACTAMENTE estas secciones y clases (en este orden):
 9) <section class="team-section section-padding p-t-0"> ... (4 miembros)
 
 10) <section class="testimonials-section section-padding"> ...
-   - PROHIBIDO testimonios reales, casos de éxito o “clientes dijeron”.
-   - Usa esta sección como "Garantías/Compromisos" (2 bloques tipo quote pero sin personas reales)
+   - NO testimonios reales. Úsalo como Garantías/Compromisos (2 bloques)
 
 11) <section class="blog-section section-padding"> ...
-   - 3 entradas sugeridas (títulos, fecha, extracto)
+   - 3 entradas sugeridas
 
-REGLAS DE CONTENIDO:
-- Español natural, orientado a conversión.
+REGLAS:
+- Español orientado a conversión.
 - No headings genéricos: “Introducción”, “Conclusión”, “¿Qué es…?”
-- No definiciones estilo diccionario.
 - No “guía práctica” ni variantes.
-- Nada de Lorem ipsum.
-- Enlaces siempre href="#".
-- Imágenes siempre con rutas tipo assets/images/... (tu plugin las reescribe).
+- Enlaces href="#".
+- Imágenes assets/images/...
 TXT;
-}
+    }
 }
