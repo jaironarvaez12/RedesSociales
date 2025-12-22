@@ -17,20 +17,15 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    /**
-     * PRODUCCIÓN (mejor opción): reintentos controlados + backoff.
-     * IMPORTANTE: el worker debe tener --timeout > $timeout (ej: 5400).
-     */
-    public $timeout = 4200;          // 70 min
-    public $tries   = 5;             // reintentos controlados
-    public $backoff = [60, 120, 300, 600, 900]; // 1m,2m,5m,10m,15m
+    // Producción: reintentos controlados
+    public $timeout = 4200;
+    public $tries   = 5;
+    public $backoff = [60, 120, 300, 600, 900];
 
-    /**
-     * Para no crear filas duplicadas entre reintentos:
-     * en el primer intento se crea el registro y se guarda su ID en el job,
-     * y en reintentos se reutiliza el mismo registro.
-     */
     public ?int $registroId = null;
+
+    // contexto del brief para fallback dinámico
+    private array $briefContext = [];
 
     public function __construct(
         public string $idDominio,
@@ -41,9 +36,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
     public function handle(): void
     {
-        // ===========================================================
-        // Reusar registro entre reintentos (evita duplicados)
-        // ===========================================================
+        // Reusar registro entre reintentos
         if ($this->registroId) {
             $registro = Dominios_Contenido_DetallesModel::where('id_dominio_contenido_detalle', $this->registroId)->first();
         } else {
@@ -96,12 +89,13 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $noRepetirCorpus = $this->compactHistory($usedCorpus, 2500);
 
             // =======================================
-            // Generación con 3 intentos (internos)
+            // Generación con 3 intentos internos
             // =======================================
             $final = null;
 
             for ($attempt = 1; $attempt <= 3; $attempt++) {
                 $brief = $this->creativeBrief($this->keyword);
+                $this->briefContext = $brief;
 
                 // 1) REDACTOR
                 $draftPrompt = $this->promptRedactorJson(
@@ -121,12 +115,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 );
 
                 $draftArr = $this->safeParseOrRepair($apiKey, $model, $draftRaw, $brief);
-
-                // ✅ Validar o reparar (puro contenido generado)
-                $draftArr = $this->validateOrRepairCopy(
-                    $apiKey, $model, $draftArr, $brief,
-                    'redactor', $noRepetirTitles, $noRepetirCorpus
-                );
+                $draftArr = $this->validateOrRepairCopy($apiKey, $model, $draftArr, $brief, 'redactor', $noRepetirTitles, $noRepetirCorpus);
 
                 // 2) AUDITOR
                 $auditPrompt = $this->promptAuditorJson(
@@ -147,12 +136,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 );
 
                 $candidateArr = $this->safeParseOrRepair($apiKey, $model, $auditedRaw, $brief);
-
-                // ✅ Validar o reparar (puro contenido generado)
-                $candidateArr = $this->validateOrRepairCopy(
-                    $apiKey, $model, $candidateArr, $brief,
-                    'auditor', $noRepetirTitles, $noRepetirCorpus
-                );
+                $candidateArr = $this->validateOrRepairCopy($apiKey, $model, $candidateArr, $brief, 'auditor', $noRepetirTitles, $noRepetirCorpus);
 
                 // 3) REPAIR si viola reglas o es muy similar
                 if ($this->violatesSeoHardRules($candidateArr) || $this->isTooSimilarToAnyPrevious($candidateArr, $usedTitles, $usedCorpus)) {
@@ -173,12 +157,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                     );
 
                     $candidateArr = $this->safeParseOrRepair($apiKey, $model, $repairRaw, $brief);
-
-                    // ✅ Validar o reparar (puro contenido generado)
-                    $candidateArr = $this->validateOrRepairCopy(
-                        $apiKey, $model, $candidateArr, $brief,
-                        'repair', $noRepetirTitles, $noRepetirCorpus
-                    );
+                    $candidateArr = $this->validateOrRepairCopy($apiKey, $model, $candidateArr, $brief, 'repair', $noRepetirTitles, $noRepetirCorpus);
                 }
 
                 $final = $candidateArr;
@@ -219,7 +198,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 50)));
             }
 
-            // Post-pass (plantillas viejas con textos fijos): usando JSON
+            // Post-pass usando copy (sin textos fijos)
             [$filled, $forcedCount] = $this->forceReplaceStaticTextsInTemplate($filled, $final);
 
             // =======================================
@@ -232,7 +211,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $slug = $slugBase . '-' . $registro->id_dominio_contenido_detalle;
 
             // =======================================
-            // Guardar en BD (primero BD, luego WP en proceso separado)
+            // Guardar en BD
             // =======================================
             $registro->update([
                 'title' => $title,
@@ -244,7 +223,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             ]);
 
         } catch (\Throwable $e) {
-            // Guardar error real en BD SIEMPRE
             $isLast = ($this->attempts() >= (int)$this->tries);
 
             $registro->update([
@@ -252,29 +230,268 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 'error' => $e->getMessage() . ' | attempts=' . $this->attempts(),
             ]);
 
-            // En producción: relanzamos para que Laravel reintente según tries/backoff
             throw $e;
         }
     }
 
     // ===========================================================
-    // TEMPLATE LOADER por dominio
+    // ✅ Producción: si IA deja vacío, NO fallar -> fallback dinámico
+    // ===========================================================
+    private function validateOrRepairCopy(
+        string $apiKey,
+        string $model,
+        array $copy,
+        array $brief,
+        string $stage,
+        string $noRepetirTitles,
+        string $noRepetirCorpus
+    ): array {
+        $this->briefContext = $brief;
+
+        $copy = $this->sanitizeAndNormalizeCopy($copy);
+        $this->applyDynamicFallbacks($copy); // 🔥 evita campos vacíos
+
+        try {
+            return $this->validateAndFixCopy($copy);
+        } catch (\Throwable $e) {
+            $msg = $e->getMessage();
+
+            // Si el error es de campos vacíos/HTML vacío, aplicamos fallback fuerte y seguimos
+            if (str_contains($msg, 'Campo vacío generado:') || str_contains($msg, 'HTML vacío generado:')) {
+                $this->applyDynamicFallbacks($copy, force: true);
+                return $this->validateAndFixCopy($copy);
+            }
+
+            // Para errores de estructura (features/faq), intentamos 1 repair con IA, y si no, fallback.
+            $repairRaw = $this->repairMissingFieldsViaDeepseek(
+                $apiKey,
+                $model,
+                $copy,
+                $brief,
+                $stage,
+                $msg,
+                $noRepetirTitles,
+                $noRepetirCorpus
+            );
+
+            $repaired = $this->safeParseOrRepair($apiKey, $model, $repairRaw, $brief);
+            $repaired = $this->sanitizeAndNormalizeCopy($repaired);
+            $this->applyDynamicFallbacks($repaired, force: true);
+
+            try {
+                return $this->validateAndFixCopy($repaired);
+            } catch (\Throwable $e2) {
+                // Último recurso: fallback total
+                $this->applyDynamicFallbacks($repaired, force: true, hard: true);
+                return $this->validateAndFixCopy($repaired);
+            }
+        }
+    }
+
+    private function applyDynamicFallbacks(array &$copy, bool $force = false, bool $hard = false): void
+    {
+        $kw = $this->shortKw();
+        $angle = $this->toStr($this->briefContext['angle'] ?? '');
+        $tone  = $this->toStr($this->briefContext['tone'] ?? '');
+        $cta   = $this->toStr($this->briefContext['cta'] ?? '');
+        $aud   = $this->toStr($this->briefContext['audience'] ?? '');
+
+        $needText = function(string $k) use (&$copy, $force): bool {
+            $v = trim(strip_tags($this->toStr($copy[$k] ?? '')));
+            return $force ? ($v === '') : ($v === '');
+        };
+
+        $needHtml = function(string $k) use (&$copy, $force): bool {
+            $h = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($copy[$k] ?? '')));
+            $isBlank = ($h === '' || $this->isBlankHtml($h) || preg_match('~<p>\s*</p>~i', $h));
+            return $force ? $isBlank : $isBlank;
+        };
+
+        // --- Campos simples
+        if ($needText('hero_kicker')) {
+            $copy['hero_kicker'] = $this->pick([
+                "Web enfocada en captar clientes",
+                "Diseño web con intención",
+                "Sitio profesional que convierte",
+                "Página corporativa optimizada",
+            ]) . " · {$kw}";
+            $copy['hero_kicker'] = mb_substr($copy['hero_kicker'], 0, 48);
+        }
+
+        if ($needText('price_h2')) {
+            $copy['price_h2'] = $this->pick([
+                "Lanza tu web desde 500 €",
+                "Web lista para convertir desde 500 €",
+                "Tu web optimizada desde 500 €",
+                "Página profesional desde 500 €",
+            ]);
+            $copy['price_h2'] = mb_substr($copy['price_h2'], 0, 48);
+        }
+
+        if ($needText('btn_presupuesto')) $copy['btn_presupuesto'] = $this->pick(["Solicitar presupuesto","Pedir presupuesto","Pedir propuesta"]);
+        if ($needText('btn_reunion'))     $copy['btn_reunion']     = $this->pick(["Reservar llamada","Agendar llamada","Hablar con un experto"]);
+
+        // --- Kit Digital (todo generado / variable)
+        if ($needText('kitdigital_bold')) {
+            $copy['kitdigital_bold'] = $this->pick([
+                "Kit Digital para impulsar tu web",
+                "Aprovecha el Kit Digital",
+                "Activa tu Kit Digital",
+            ]);
+        }
+        if ($needHtml('kitdigital_p_html')) {
+            $copy['kitdigital_p_html'] =
+                "<p>Si encajas en el <strong>Kit Digital</strong>, te guiamos en la solicitud y adaptamos {$kw} para dejar la web lista para captar oportunidades, sin pasos confusos ni bloqueos.</p>";
+        }
+        if ($needText('btn_kitdigital')) {
+            $copy['btn_kitdigital'] = $this->pick(["Acceder al Kit Digital","Ver opciones Kit Digital","Solicitar Kit Digital"]);
+            $copy['btn_kitdigital'] = mb_substr($copy['btn_kitdigital'], 0, 26);
+        }
+
+        // --- Clients / reviews / projects (aquí estaba tu crash)
+        if ($needText('clients_label')) {
+            $copy['clients_label'] = $this->pick(["Clientes","Marcas","Empresas","Negocios","Equipos"]);
+        }
+        if ($needText('clients_subtitle')) {
+            $copy['clients_subtitle'] = $this->pick([
+                "Equipos que buscan claridad y conversión en {$kw}.",
+                "Negocios que priorizan resultados medibles y ejecución rápida.",
+                "Marcas que quieren una web coherente con su propuesta y fácil de publicar.",
+            ]) . ($angle !== '' ? " Enfoque: {$angle}." : '');
+            $copy['clients_subtitle'] = mb_substr($copy['clients_subtitle'], 0, 140);
+        }
+        if ($needText('reviews_label')) {
+            $copy['reviews_label'] = $this->pick(["Opiniones","Reseñas","Valoraciones","Resultados"]);
+        }
+        if ($needText('testimonios_title')) {
+            $copy['testimonios_title'] = $this->pick([
+                "Lo que valoran quienes trabajan con nosotros",
+                "Por qué este enfoque funciona",
+                "Experiencias de proyectos similares",
+            ]);
+        }
+        if ($needText('projects_title')) {
+            $copy['projects_title'] = $this->pick([
+                "Proyectos web: estructura, rendimiento y conversión",
+                "Trabajos publicados: enfoque y ejecución",
+                "Casos de web: claridad y resultados",
+            ]);
+        }
+
+        // --- HTML principales
+        if ($needHtml('hero_p_html')) {
+            $copy['hero_p_html'] = "<p>Construimos {$kw} con un mensaje claro, estructura escaneable y decisiones orientadas a convertir. {$tone}" . ($aud !== '' ? " Pensado para {$aud}." : '') . "</p>";
+        }
+        if ($needHtml('kit_p_html')) {
+            $copy['kit_p_html'] = "<p>Un kit completo para implementar rápido: estructura, copy y bloques listos para publicar en {$kw}, sin secciones vacías.</p>";
+        }
+        if ($needHtml('pack_p_html')) {
+            $copy['pack_p_html'] = "<p>Pack listo para publicar: secciones coherentes, beneficios claros y CTA alineado a {$cta}.</p>";
+        }
+
+        // --- Estructuras (features / faq): si faltan, se generan
+        $copy['features'] = (isset($copy['features']) && is_array($copy['features'])) ? $copy['features'] : [];
+        $copy['faq']      = (isset($copy['faq']) && is_array($copy['faq'])) ? $copy['faq'] : [];
+
+        if ($hard || count($copy['features']) !== 4) {
+            $copy['features'] = [];
+            $templates = [
+                ["Claridad en la propuesta", "<p><strong>Qué aporta:</strong> aterriza tu oferta para que {$kw} se entienda en segundos y empuje a la acción.</p>"],
+                ["Estructura pensada para convertir", "<p><strong>Qué aporta:</strong> ordena secciones por intención (beneficio → prueba → CTA) sin relleno.</p>"],
+                ["SEO natural sin stuffing", "<p><strong>Qué aporta:</strong> semántica y intención de búsqueda integradas, sin repetir la keyword como robot.</p>"],
+                ["Listo para publicar", "<p><strong>Qué aporta:</strong> bloques y textos preparados para Elementor/WordPress, sin huecos ni remiendos.</p>"],
+            ];
+            foreach ($templates as $t) {
+                $copy['features'][] = ['title' => $t[0] . " · {$kw}", 'p_html' => $t[1]];
+            }
+        } else {
+            // completar huecos internos
+            for ($i=0; $i<4; $i++) {
+                if (!isset($copy['features'][$i]) || !is_array($copy['features'][$i])) $copy['features'][$i] = [];
+                if (trim(strip_tags($this->toStr($copy['features'][$i]['title'] ?? ''))) === '') {
+                    $copy['features'][$i]['title'] = $this->pick([
+                        "Mejora clave", "Optimización", "Ventaja", "Bloque de conversión"
+                    ]) . " · {$kw}";
+                }
+                $p = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($copy['features'][$i]['p_html'] ?? '')));
+                if ($p === '' || $this->isBlankHtml($p)) {
+                    $copy['features'][$i]['p_html'] = "<p><strong>Qué aporta:</strong> mejora concreta en claridad y conversión aplicada a {$kw}.</p>";
+                }
+            }
+        }
+
+        if ($hard || count($copy['faq']) !== 9) {
+            $copy['faq'] = [];
+            $qTpl = [
+                "¿Qué incluye exactamente {$kw}?",
+                "¿Cuánto tarda en estar listo {$kw}?",
+                "¿Qué necesito aportar para empezar?",
+                "¿Se adapta a mi sector o ciudad?",
+                "¿Cómo evitamos contenido duplicado?",
+                "¿Puedo publicar yo mismo?",
+                "¿Qué diferencia esto de algo genérico?",
+                "¿Hay ajustes después de la entrega?",
+                "¿Qué no incluye para evitar falsas expectativas?",
+            ];
+            $aTpl = [
+                "<p>Incluye estructura, copy y bloques listos para publicar, alineados a intención y conversión.</p>",
+                "<p>Depende del alcance, pero normalmente se avanza rápido con un brief corto y entregables claros.</p>",
+                "<p>Con tu oferta, público y 2–3 referencias arrancamos. Si falta claridad, lo definimos contigo.</p>",
+                "<p>Sí. Ajustamos el mensaje a tu contexto y variamos semántica sin forzar la keyword.</p>",
+                "<p>Se trabaja con ángulos y estructuras distintas, y se compara contra historial para variar de verdad.</p>",
+                "<p>Sí. Te dejamos formato limpio para Elementor/WordPress y una guía simple de publicación.</p>",
+                "<p>La diferencia está en intención, objeciones y CTA: no es texto por texto, es copy que guía decisión.</p>",
+                "<p>Se contempla una ronda razonable de ajustes para mantener coherencia y calidad.</p>",
+                "<p>No prometemos resultados irreales: definimos alcance, tiempos y entregables con transparencia.</p>",
+            ];
+            for ($i=0; $i<9; $i++) {
+                $copy['faq'][] = ['q' => $qTpl[$i], 'a_html' => $aTpl[$i]];
+            }
+        } else {
+            for ($i=0; $i<9; $i++) {
+                if (!isset($copy['faq'][$i]) || !is_array($copy['faq'][$i])) $copy['faq'][$i] = [];
+                if (trim(strip_tags($this->toStr($copy['faq'][$i]['q'] ?? ''))) === '') {
+                    $copy['faq'][$i]['q'] = "¿Cómo funciona {$kw}?";
+                }
+                $a = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($copy['faq'][$i]['a_html'] ?? '')));
+                if ($a === '' || $this->isBlankHtml($a)) {
+                    $copy['faq'][$i]['a_html'] = "<p>Lo adaptamos a tu caso y lo dejamos listo para publicar, sin huecos ni secciones vacías.</p>";
+                }
+            }
+        }
+
+        // --- Campos restantes obligatorios (si aún faltan)
+        $defaultsText = [
+            'seo_title' => "Web profesional para {$kw} lista para convertir y publicar",
+            'hero_h1' => "{$kw} con estructura y copy que convierten",
+            'kit_h1' => "Kit para {$kw}",
+            'pack_h2' => "Pack de {$kw} listo para publicar",
+            'faq_title' => "Preguntas frecuentes sobre {$kw}",
+            'final_cta_h3' => "¿Listo para avanzar con {$kw}?",
+        ];
+
+        foreach ($defaultsText as $k => $v) {
+            if ($needText($k)) $copy[$k] = $v;
+        }
+
+        // seo_title en rango (aprox)
+        $seo = trim(strip_tags($this->toStr($copy['seo_title'] ?? '')));
+        if ($seo === '') $seo = $defaultsText['seo_title'];
+        if (mb_strlen($seo) > 65) $seo = rtrim(mb_substr($seo, 0, 65), " \t\n\r\0\x0B-–—|:");
+        $copy['seo_title'] = $seo;
+    }
+
+    // ===========================================================
+    // TEMPLATE LOADER
     // ===========================================================
     private function loadElementorTemplateForDomainWithPath(int $idDominio): array
     {
         $dominio = DominiosModel::where('id_dominio', $idDominio)->first();
-        if (!$dominio) {
-            throw new \RuntimeException("Dominio no encontrado (id={$idDominio})");
-        }
+        if (!$dominio) throw new \RuntimeException("Dominio no encontrado (id={$idDominio})");
 
         $templateRel = trim((string)($dominio->elementor_template_path ?? ''));
-        if ($templateRel === '') {
-            $templateRel = trim((string) env('ELEMENTOR_TEMPLATE_PATH', ''));
-        }
-
-        if ($templateRel === '') {
-            throw new \RuntimeException('No hay plantilla configurada (dominio ni env ELEMENTOR_TEMPLATE_PATH).');
-        }
+        if ($templateRel === '') $templateRel = trim((string) env('ELEMENTOR_TEMPLATE_PATH', ''));
+        if ($templateRel === '') throw new \RuntimeException('No hay plantilla configurada (dominio ni env ELEMENTOR_TEMPLATE_PATH).');
 
         $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
 
@@ -286,15 +503,10 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         $templateRel = preg_replace('~^/?storage/app/~i', '', $templateRel);
         $templateRel = ltrim(str_replace('\\', '/', $templateRel), '/');
 
-        if (str_contains($templateRel, '..')) {
-            throw new \RuntimeException('Template path inválido (no se permite "..")');
-        }
+        if (str_contains($templateRel, '..')) throw new \RuntimeException('Template path inválido (no se permite "..")');
 
         $templatePath = storage_path('app/' . $templateRel);
-
-        if (!is_file($templatePath)) {
-            throw new \RuntimeException("No existe el template en disco: {$templatePath} (path={$templateRel})");
-        }
+        if (!is_file($templatePath)) throw new \RuntimeException("No existe el template en disco: {$templatePath} (path={$templateRel})");
 
         $raw = (string) file_get_contents($templatePath);
         $tpl = json_decode($raw, true);
@@ -333,9 +545,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             'max_tokens' => $maxTokens,
         ];
 
-        if ($jsonMode) {
-            $payload['response_format'] = ['type' => 'json_object'];
-        }
+        if ($jsonMode) $payload['response_format'] = ['type' => 'json_object'];
 
         $resp = Http::withHeaders([
                 'Authorization' => 'Bearer ' . $apiKey,
@@ -363,16 +573,11 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             }
         }
 
-        if (!$resp->successful()) {
-            throw new \RuntimeException("DeepSeek error {$resp->status()}: {$resp->body()}");
-        }
+        if (!$resp->successful()) throw new \RuntimeException("DeepSeek error {$resp->status()}: {$resp->body()}");
 
         $data = $resp->json();
         $text = trim((string)($data['choices'][0]['message']['content'] ?? ''));
-
-        if ($text === '') {
-            throw new \RuntimeException("DeepSeek returned empty text.");
-        }
+        if ($text === '') throw new \RuntimeException("DeepSeek returned empty text.");
 
         return $text;
     }
@@ -464,9 +669,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         ];
 
         $out = $skeleton;
-        foreach ($partial as $k => $v) {
-            $out[$k] = $v;
-        }
+        foreach ($partial as $k => $v) $out[$k] = $v;
         return $out;
     }
 
@@ -480,24 +683,20 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 Devuelve SOLO JSON válido. Sin markdown. Sin texto fuera del JSON.
 RESPUESTA MINIFICADA (sin saltos de línea).
 
-Tienes un JSON incompleto/cortado o inválido. Debes:
-- Completarlo y dejarlo VÁLIDO.
-- Mantener EXACTAMENTE este esquema y keys (todas obligatorias y NO vacías):
-  seo_title, hero_kicker, hero_h1, hero_p_html,
-  kit_h1, kit_p_html,
-  pack_h2, pack_p_html, price_h2,
-  features (4),
-  clients_label, clients_subtitle, reviews_label, testimonios_title, projects_title,
-  faq_title, faq (9),
-  final_cta_h3,
-  btn_presupuesto, btn_reunion,
-  kitdigital_bold, kitdigital_p_html, btn_kitdigital
+Completa este JSON y devuélvelo VÁLIDO con estas keys obligatorias:
+seo_title, hero_kicker, hero_h1, hero_p_html,
+kit_h1, kit_p_html, pack_h2, pack_p_html, price_h2,
+features (4),
+clients_label, clients_subtitle, reviews_label, testimonios_title, projects_title,
+faq_title, faq (9),
+final_cta_h3, btn_presupuesto, btn_reunion,
+kitdigital_bold, kitdigital_p_html, btn_kitdigital
+
+Reglas:
 - HTML permitido SOLO: <p>, <strong>, <br>
 - SOLO 1 H1: hero_h1 (no uses <h1>)
 - 4 features exactas y 9 FAQs exactas
-- NO puede haber campos vacíos ni "<p></p>" ni "<p> </p>"
-- seo_title 60-65 chars (aprox) y sin cortar palabras
-- Responde sin saltos de línea para no cortar
+- NO vacíos ni "<p></p>" ni "<p> </p>"
 
 Estilo:
 - Ángulo: {$angle}
@@ -507,15 +706,7 @@ JSON roto:
 {$broken}
 PROMPT;
 
-        return $this->deepseekText(
-            $apiKey,
-            $model,
-            $prompt,
-            maxTokens: 3400,
-            temperature: 0.18,
-            topP: 0.90,
-            jsonMode: true
-        );
+        return $this->deepseekText($apiKey, $model, $prompt, maxTokens: 3400, temperature: 0.18, topP: 0.90, jsonMode: true);
     }
 
     private function parseJsonStrict(string $raw): array
@@ -550,7 +741,6 @@ PROMPT;
         if ($pos !== false) $raw = substr($raw, $pos);
 
         $out = [];
-
         foreach ([
             'seo_title','hero_kicker','hero_h1','hero_p_html',
             'kit_h1','kit_p_html',
@@ -660,7 +850,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // PROMPTS (TODO generado)
+    // PROMPTS
     // ===========================================================
     private function promptRedactorJson(string $tipo, string $keyword, string $noRepetirTitles, string $noRepetirCorpus, array $brief): string
     {
@@ -687,26 +877,14 @@ NO REPETIR TÍTULOS:
 NO REPETIR FRASES / SUBTEMAS:
 {$noRepetirCorpus}
 
-REGLAS DURAS:
-- TODO debe venir en el JSON: NO uses textos genéricos repetidos, NO “placeholders”, NO campos vacíos.
-- Si un campo “no aplica”, escribe una variante útil (nunca lo dejes vacío).
-- SOLO 1 H1: solo "hero_h1". No uses <h1>.
-- No “Introducción”, “Conclusión”, “¿Qué es…?”.
-- No testimonios reales ni claims falsos.
-- Evita keyword stuffing.
+REGLAS:
+- TODO debe venir relleno (nunca vacío).
+- SOLO 1 H1: hero_h1 (no uses <h1>).
 - HTML permitido: <p>, <strong>, <br>.
-- Devuelve EXACTAMENTE 4 features y EXACTAMENTE 9 FAQs.
-- NO puede haber campos vacíos ni "<p></p>" ni "<p> </p>".
-- Longitudes cortas para evitar cortes:
-  hero_p_html/kit_p_html/pack_p_html/kitdigital_p_html <= 340 chars
-  feature p_html <= 260 chars
-  faq a_html <= 280 chars
-  seo_title 60-65 chars (aprox) sin cortar palabras
-  hero_kicker <= 48 chars
-  price_h2 <= 48 chars
-  botones <= 26 chars
+- EXACTAMENTE 4 features y EXACTAMENTE 9 FAQs.
+- Sin "<p></p>" ni "<p> </p>".
 
-ESQUEMA EXACTO (keys obligatorias):
+ESQUEMA EXACTO:
 {"seo_title":"...","hero_kicker":"...","hero_h1":"...","hero_p_html":"<p>...</p>","kit_h1":"...","kit_p_html":"<p>...</p>","pack_h2":"...","pack_p_html":"<p>...</p>","price_h2":"...","features":[{"title":"...","p_html":"<p>...</p>"},{"title":"...","p_html":"<p>...</p>"},{"title":"...","p_html":"<p>...</p>"},{"title":"...","p_html":"<p>...</p>"}],"clients_label":"...","clients_subtitle":"...","reviews_label":"...","testimonios_title":"...","projects_title":"...","faq_title":"...","faq":[{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"}],"final_cta_h3":"...","btn_presupuesto":"...","btn_reunion":"...","kitdigital_bold":"...","kitdigital_p_html":"<p>...</p>","btn_kitdigital":"..."}
 PROMPT;
     }
@@ -739,13 +917,6 @@ NO repetir textos:
 
 BORRADOR:
 {$draftShort}
-
-Reglas:
-- 1 H1: solo hero_h1.
-- 4 features / 9 faq exactas.
-- HTML: <p>, <strong>, <br>.
-- Sin relleno. Todo útil y específico.
-- Mantén el MISMO esquema/keys.
 PROMPT;
     }
 
@@ -758,7 +929,7 @@ PROMPT;
         return <<<PROMPT
 Corrige este JSON para que cumpla reglas y sea distinto.
 Devuelve SOLO JSON válido con el MISMO esquema. RESPUESTA MINIFICADA.
-NO puede haber campos vacíos ni "<p></p>" ni "<p> </p>".
+NO puede haber campos vacíos ni "<p></p>".
 
 Keyword: {$keyword}
 Ángulo: {$angle}
@@ -772,66 +943,7 @@ NO repetir textos:
 
 JSON a reparar:
 {$short}
-
-Checklist:
-- Solo 1 H1: hero_h1 (no uses <h1>)
-- seo_title 60-65 (aprox) sin cortar palabras
-- 4 features / 9 faq exactas (y todas con contenido)
-- HTML: <p>, <strong>, <br>
-- Todos los campos obligatorios NO vacíos:
-  seo_title, hero_kicker, hero_h1, hero_p_html, kit_h1, kit_p_html,
-  pack_h2, pack_p_html, price_h2,
-  clients_label, clients_subtitle, reviews_label, testimonios_title, projects_title,
-  faq_title, final_cta_h3, btn_presupuesto, btn_reunion,
-  kitdigital_bold, kitdigital_p_html, btn_kitdigital
 PROMPT;
-    }
-
-    // ===========================================================
-    // ✅ VALIDAR O REPARAR (arregla campos vacíos como clients_label)
-    // ===========================================================
-    private function validateOrRepairCopy(
-        string $apiKey,
-        string $model,
-        array $copy,
-        array $brief,
-        string $stage,
-        string $noRepetirTitles,
-        string $noRepetirCorpus
-    ): array {
-        $copy = $this->sanitizeAndNormalizeCopy($copy);
-
-        try {
-            return $this->validateAndFixCopy($copy);
-        } catch (\Throwable $e) {
-            $lastErr = $e->getMessage();
-            $current = $copy;
-
-            for ($i = 1; $i <= 2; $i++) {
-                $repairRaw = $this->repairMissingFieldsViaDeepseek(
-                    $apiKey,
-                    $model,
-                    $current,
-                    $brief,
-                    $stage,
-                    $lastErr,
-                    $noRepetirTitles,
-                    $noRepetirCorpus
-                );
-
-                $repaired = $this->safeParseOrRepair($apiKey, $model, $repairRaw, $brief);
-                $repaired = $this->sanitizeAndNormalizeCopy($repaired);
-
-                try {
-                    return $this->validateAndFixCopy($repaired);
-                } catch (\Throwable $e2) {
-                    $lastErr = $e2->getMessage();
-                    $current = $repaired;
-                }
-            }
-
-            throw new \RuntimeException("No se pudo validar/reparar JSON ({$stage}): {$lastErr}");
-        }
     }
 
     private function repairMissingFieldsViaDeepseek(
@@ -860,7 +972,7 @@ Contexto:
 - Keyword: {$this->keyword}
 - Tipo: {$this->tipo}
 - Etapa: {$stage}
-- Error de validación: {$error}
+- Error: {$error}
 
 BRIEF:
 - Ángulo: {$angle}
@@ -875,44 +987,283 @@ NO repetir textos:
 {$noRepetirCorpus}
 
 Tarea:
-- Tienes un JSON casi completo pero con campos vacíos o inválidos.
-- Devuelve el MISMO esquema/keys y:
-  1) Rellena TODOS los campos vacíos con contenido real y específico.
-  2) NO borres lo que ya está bien.
-  3) NO dejes strings vacíos.
-  4) No uses placeholders ("TODO", "...", "pendiente").
-  5) Sin testimonios reales ni claims falsos.
+- Rellena campos vacíos/invalidos, mantén lo que esté bien.
+- NO dejes strings vacíos.
+- 4 features exactas y 9 FAQs exactas.
+- HTML SOLO: <p>, <strong>, <br>.
 
-Reglas duras:
-- HTML permitido SOLO: <p>, <strong>, <br>
-- SOLO 1 H1: hero_h1 (no uses <h1>)
-- EXACTAMENTE 4 features y EXACTAMENTE 9 FAQs
-- NO puede haber "<p></p>" ni "<p> </p>"
-- seo_title 60-65 chars aprox, sin cortar palabras
-- hero_kicker <= 48 chars
-- price_h2 <= 48 chars
-- botones <= 26 chars
-
-ESQUEMA EXACTO (keys obligatorias):
-{"seo_title":"...","hero_kicker":"...","hero_h1":"...","hero_p_html":"<p>...</p>","kit_h1":"...","kit_p_html":"<p>...</p>","pack_h2":"...","pack_p_html":"<p>...</p>","price_h2":"...","features":[{"title":"...","p_html":"<p>...</p>"},{"title":"...","p_html":"<p>...</p>"},{"title":"...","p_html":"<p>...</p>"},{"title":"...","p_html":"<p>...</p>"}],"clients_label":"...","clients_subtitle":"...","reviews_label":"...","testimonios_title":"...","projects_title":"...","faq_title":"...","faq":[{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"},{"q":"...","a_html":"<p>...</p>"}],"final_cta_h3":"...","btn_presupuesto":"...","btn_reunion":"...","kitdigital_bold":"...","kitdigital_p_html":"<p>...</p>","btn_kitdigital":"..."}
-
-JSON actual (a corregir):
+JSON actual:
 {$json}
 PROMPT;
 
-        return $this->deepseekText(
-            $apiKey,
-            $model,
-            $prompt,
-            maxTokens: 3400,
-            temperature: 0.20,
-            topP: 0.90,
-            jsonMode: true
-        );
+        return $this->deepseekText($apiKey, $model, $prompt, maxTokens: 3400, temperature: 0.20, topP: 0.90, jsonMode: true);
     }
 
     // ===========================================================
-    // Coerción segura + VALIDACIÓN ESTRICTA (puro generado)
+    // SANITIZE + VALIDATE
+    // ===========================================================
+    private function sanitizeAndNormalizeCopy(array $copy): array
+    {
+        $copy['features'] = isset($copy['features']) && is_array($copy['features']) ? $copy['features'] : [];
+        $copy['faq']      = isset($copy['faq']) && is_array($copy['faq']) ? $copy['faq'] : [];
+
+        foreach (['hero_p_html','kit_p_html','pack_p_html','kitdigital_p_html'] as $k) {
+            if (isset($copy[$k])) {
+                $copy[$k] = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($copy[$k])));
+            }
+        }
+
+        if (isset($copy['seo_title'])) {
+            $seo = trim(strip_tags($this->toStr($copy['seo_title'])));
+            if (mb_strlen($seo) > 65) {
+                $seo = rtrim(mb_substr($seo, 0, 65), " \t\n\r\0\x0B-–—|:");
+            }
+            $copy['seo_title'] = $seo;
+        }
+
+        if (is_array($copy['features']) && count($copy['features']) > 4) $copy['features'] = array_slice($copy['features'], 0, 4);
+        if (is_array($copy['faq']) && count($copy['faq']) > 9) $copy['faq'] = array_slice($copy['faq'], 0, 9);
+
+        return $copy;
+    }
+
+    private function validateAndFixCopy(array $copy): array
+    {
+        $copy = $this->sanitizeAndNormalizeCopy($copy);
+
+        // la clave: fallback antes de validar
+        $this->applyDynamicFallbacks($copy, force: true);
+
+        // validaciones
+        foreach ([
+            'seo_title','hero_kicker','hero_h1',
+            'kit_h1','pack_h2','price_h2',
+            'clients_label','clients_subtitle','reviews_label','testimonios_title','projects_title',
+            'faq_title','final_cta_h3',
+            'btn_presupuesto','btn_reunion',
+            'kitdigital_bold','btn_kitdigital',
+        ] as $k) {
+            $this->requireText($copy[$k] ?? '', $k);
+        }
+
+        foreach (['hero_p_html','kit_p_html','pack_p_html','kitdigital_p_html'] as $k) {
+            $this->requireHtml($copy[$k] ?? '', $k);
+        }
+
+        if (!is_array($copy['features']) || count($copy['features']) !== 4) {
+            throw new \RuntimeException('Debe haber EXACTAMENTE 4 features generadas.');
+        }
+        if (!is_array($copy['faq']) || count($copy['faq']) !== 9) {
+            throw new \RuntimeException('Debe haber EXACTAMENTE 9 FAQs generadas.');
+        }
+
+        foreach ($copy['features'] as $i => $f) {
+            if (!is_array($f)) throw new \RuntimeException("Feature inválida index {$i}");
+            $this->requireText($f['title'] ?? '', "features[$i].title");
+            $this->requireHtml($f['p_html'] ?? '', "features[$i].p_html");
+        }
+
+        foreach ($copy['faq'] as $i => $q) {
+            if (!is_array($q)) throw new \RuntimeException("FAQ inválida index {$i}");
+            $this->requireText($q['q'] ?? '', "faq[$i].q");
+            $this->requireHtml($q['a_html'] ?? '', "faq[$i].a_html");
+        }
+
+        if ($this->violatesSeoHardRules($copy)) {
+            throw new \RuntimeException("El JSON viola reglas SEO/H1");
+        }
+
+        return $copy;
+    }
+
+    // ===========================================================
+    // TOKENS
+    // ===========================================================
+    private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
+    {
+        $copy = $this->validateAndFixCopy($copy);
+
+        $dict = $this->buildPrettyTokenDictionary($copy);
+
+        $replacedCount = 0;
+        $this->replaceTokensDeep($tpl, $dict, $replacedCount);
+
+        $remaining = $this->collectRemainingTokensDeep($tpl);
+
+        return [$tpl, $replacedCount, $remaining];
+    }
+
+    private function buildPrettyTokenDictionary(array $copy): array
+    {
+        $featuresListHtml = $this->buildFeaturesListHtml($copy);
+
+        $dict = [
+            // HERO
+            '{{HERO_KICKER}}' => trim(strip_tags($this->toStr($copy['hero_kicker']))),
+            '{{HERO_H1}}'     => trim(strip_tags($this->toStr($copy['hero_h1']))),
+            '{{HERO_P}}'      => $this->keepAllowedInlineHtml($this->toStr($copy['hero_p_html'])),
+
+            // PACK / precio
+            '{{PACK_H2}}'   => trim(strip_tags($this->toStr($copy['pack_h2']))),
+            '{{PACK_P}}'    => $this->keepAllowedInlineHtml($this->toStr($copy['pack_p_html'])),
+            '{{PRICE_H2}}'  => trim(strip_tags($this->toStr($copy['price_h2']))),
+
+            // KIT
+            '{{KIT_H1}}' => trim(strip_tags($this->toStr($copy['kit_h1']))),
+            '{{KIT_P}}'  => $this->keepAllowedInlineHtml($this->toStr($copy['kit_p_html'])),
+
+            // FEATURES (incluye FEATURE_3_TITLE ✅)
+            '{{FEATURE_1_TITLE}}' => trim(strip_tags($this->toStr($copy['features'][0]['title']))),
+            '{{FEATURE_1_P}}'     => $this->keepAllowedInlineHtml($this->toStr($copy['features'][0]['p_html'])),
+
+            '{{FEATURE_2_TITLE}}' => trim(strip_tags($this->toStr($copy['features'][1]['title']))),
+            '{{FEATURE_2_P}}'     => $this->keepAllowedInlineHtml($this->toStr($copy['features'][1]['p_html'])),
+
+            '{{FEATURE_3_TITLE}}' => trim(strip_tags($this->toStr($copy['features'][2]['title']))),
+            '{{FEATURE_3_P}}'     => $this->keepAllowedInlineHtml($this->toStr($copy['features'][2]['p_html'])),
+
+            '{{FEATURE_4_TITLE}}' => trim(strip_tags($this->toStr($copy['features'][3]['title']))),
+            '{{FEATURE_4_P}}'     => $this->keepAllowedInlineHtml($this->toStr($copy['features'][3]['p_html'])),
+
+            '{{FEATURES_LIST_HTML}}' => $featuresListHtml,
+
+            // CLIENTS / REVIEWS / PROJECTS ✅
+            '{{CLIENTS_LABEL}}'     => trim(strip_tags($this->toStr($copy['clients_label']))),
+            '{{CLIENTS_SUBTITLE}}'  => trim(strip_tags($this->toStr($copy['clients_subtitle']))),
+            '{{REVIEWS_LABEL}}'     => trim(strip_tags($this->toStr($copy['reviews_label']))),
+            '{{TESTIMONIOS_TITLE}}' => trim(strip_tags($this->toStr($copy['testimonios_title']))),
+            '{{PROJECTS_TITLE}}'    => trim(strip_tags($this->toStr($copy['projects_title']))),
+
+            // FAQ
+            '{{FAQ_TITLE}}' => trim(strip_tags($this->toStr($copy['faq_title']))),
+
+            // CTA final
+            '{{FINAL_CTA}}' => trim(strip_tags($this->toStr($copy['final_cta_h3']))),
+
+            // Botones
+            '{{BTN_PRESUPUESTO}}' => trim(strip_tags($this->toStr($copy['btn_presupuesto']))),
+            '{{BTN_REUNION}}'     => trim(strip_tags($this->toStr($copy['btn_reunion']))),
+
+            // Kit Digital ✅
+            '{{KITDIGITAL_BOLD}}' => trim(strip_tags($this->toStr($copy['kitdigital_bold']))),
+            '{{KITDIGITAL_P}}'    => $this->keepAllowedInlineHtml($this->toStr($copy['kitdigital_p_html'])),
+            '{{BTN_KITDIGITAL}}'  => trim(strip_tags($this->toStr($copy['btn_kitdigital']))),
+        ];
+
+        // FAQ 1..9
+        for ($i = 0; $i < 9; $i++) {
+            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = trim(strip_tags($this->toStr($copy['faq'][$i]['q'])));
+            $dict['{{FAQ_' . ($i + 1) . '_A}}'] = $this->keepAllowedInlineHtml($this->toStr($copy['faq'][$i]['a_html']));
+        }
+
+        return $dict;
+    }
+
+    private function buildFeaturesListHtml(array $copy): string
+    {
+        $parts = [];
+        for ($i = 0; $i < 4; $i++) {
+            $t = trim(strip_tags($this->toStr($copy['features'][$i]['title'] ?? '')));
+            $pTxt = trim(strip_tags($this->toStr($copy['features'][$i]['p_html'] ?? '')));
+            if ($t === '') $t = "Mejora clave · " . $this->shortKw();
+            if ($pTxt === '') $pTxt = $t;
+            $parts[] = "<p><strong>" . htmlspecialchars($t, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ":</strong> " . htmlspecialchars($pTxt, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . "</p>";
+        }
+        return implode('', $parts);
+    }
+
+    private function replaceTokensDeep(mixed &$node, array $dict, int &$count): void
+    {
+        if (is_array($node)) {
+            foreach ($node as &$v) $this->replaceTokensDeep($v, $dict, $count);
+            return;
+        }
+
+        if (!is_string($node) || $node === '') return;
+        if (!str_contains($node, '{{')) return;
+
+        $orig = $node;
+        $node = strtr($node, $dict);
+        if ($node !== $orig) $count++;
+    }
+
+    private function collectRemainingTokensDeep(mixed $node): array
+    {
+        $found = [];
+        $walk = function ($n) use (&$walk, &$found) {
+            if (is_array($n)) { foreach ($n as $v) $walk($v); return; }
+            if (!is_string($n) || $n === '') return;
+            if (preg_match_all('/\{\{[A-Z0-9_]+\}\}/', $n, $m)) foreach ($m[0] as $tok) $found[] = $tok;
+        };
+        $walk($node);
+        $found = array_values(array_unique($found));
+        sort($found);
+        return $found;
+    }
+
+    // ===========================================================
+    // Post-pass sin texto fijo (usa copy)
+    // ===========================================================
+    private function forceReplaceStaticTextsInTemplate(array $tpl, array $copy): array
+    {
+        $mapExact = [];
+
+        $bp = trim(strip_tags($this->toStr($copy['btn_presupuesto'] ?? '')));
+        $br = trim(strip_tags($this->toStr($copy['btn_reunion'] ?? '')));
+        $bk = trim(strip_tags($this->toStr($copy['btn_kitdigital'] ?? '')));
+        $fc = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? '')));
+
+        if ($bp !== '') {
+            $mapExact["Solicitar presupuesto"] = $bp;
+            $mapExact["Pedir presupuesto"] = $bp;
+            $mapExact["Solicitar propuesta"] = $bp;
+        }
+        if ($br !== '') {
+            $mapExact["Reservar llamada"] = $br;
+            $mapExact["Agendar reunión"] = $br;
+            $mapExact["Agendar reunion"] = $br;
+            $mapExact["Agendar llamada"] = $br;
+        }
+        if ($bk !== '') {
+            $mapExact["Acceder al Kit Digital"] = $bk;
+            $mapExact["Ver Kit Digital"] = $bk;
+            $mapExact["Solicitar Kit Digital"] = $bk;
+        }
+        if ($fc !== '') {
+            $mapExact["¿Listo para avanzar con agencias de publicidad?"] = $fc;
+        }
+
+        $count = 0;
+        if (!empty($mapExact)) $this->replaceStringsRecursive($tpl, $mapExact, $count);
+
+        return [$tpl, $count];
+    }
+
+    private function replaceStringsRecursive(mixed &$node, array $mapExact, int &$count): void
+    {
+        if (is_array($node)) {
+            foreach ($node as &$v) $this->replaceStringsRecursive($v, $mapExact, $count);
+            return;
+        }
+        if (!is_string($node) || $node === '') return;
+
+        $orig = $node;
+        $trim = trim($node);
+
+        if (isset($mapExact[$trim])) {
+            $node = $mapExact[$trim];
+        } else {
+            foreach ($mapExact as $from => $to) {
+                if ($from === '') continue;
+                if (str_contains($node, $from)) $node = str_replace($from, $to, $node);
+            }
+        }
+
+        if ($node !== $orig) $count++;
+    }
+
+    // ===========================================================
+    // Utils / validation
     // ===========================================================
     private function toStr(mixed $v): string
     {
@@ -920,28 +1271,31 @@ PROMPT;
         if (is_string($v)) return $v;
         if (is_int($v) || is_float($v)) return (string)$v;
         if (is_bool($v)) return $v ? '1' : '0';
-
         if (is_array($v)) {
             foreach (['text','content','value','html'] as $k) {
                 if (array_key_exists($k, $v)) return $this->toStr($v[$k]);
             }
-            $scalars = [];
-            foreach ($v as $item) {
-                if (is_scalar($item)) $scalars[] = (string)$item;
-            }
-            if (!empty($scalars)) return implode(' ', $scalars);
-
             $j = json_encode($v, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             return is_string($j) ? $j : '';
         }
-
         if (is_object($v)) {
             if ($v instanceof \Stringable) return (string)$v;
             $j = json_encode($v, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             return is_string($j) ? $j : '';
         }
-
         return '';
+    }
+
+    private function pick(array $arr): string
+    {
+        return $arr[random_int(0, count($arr) - 1)];
+    }
+
+    private function shortKw(): string
+    {
+        $kw = trim((string)$this->keyword);
+        if ($kw === '') return 'tu proyecto';
+        return mb_substr($kw, 0, 70);
     }
 
     private function isBlankHtml(string $html): bool
@@ -968,9 +1322,7 @@ PROMPT;
     private function requireText(mixed $value, string $field): string
     {
         $v = trim(strip_tags($this->toStr($value)));
-        if ($v === '') {
-            throw new \RuntimeException("Campo vacío generado: {$field}");
-        }
+        if ($v === '') throw new \RuntimeException("Campo vacío generado: {$field}");
         return $v;
     }
 
@@ -981,101 +1333,6 @@ PROMPT;
             throw new \RuntimeException("HTML vacío generado: {$field}");
         }
         return $h;
-    }
-
-    private function sanitizeAndNormalizeCopy(array $copy): array
-    {
-        $copy['features'] = isset($copy['features']) && is_array($copy['features']) ? $copy['features'] : [];
-        $copy['faq']      = isset($copy['faq']) && is_array($copy['faq']) ? $copy['faq'] : [];
-
-        foreach (['hero_p_html','kit_p_html','pack_p_html','kitdigital_p_html'] as $k) {
-            if (isset($copy[$k])) {
-                $copy[$k] = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($copy[$k])));
-            }
-        }
-
-        if (isset($copy['seo_title'])) {
-            $seo = trim(strip_tags($this->toStr($copy['seo_title'])));
-            if (mb_strlen($seo) > 65) {
-                $seo = mb_substr($seo, 0, 65);
-                $seo = rtrim($seo, " \t\n\r\0\x0B-–—|:");
-            }
-            $copy['seo_title'] = $seo;
-        }
-
-        if (is_array($copy['features']) && count($copy['features']) > 4) {
-            $copy['features'] = array_slice($copy['features'], 0, 4);
-        }
-        if (is_array($copy['faq']) && count($copy['faq']) > 9) {
-            $copy['faq'] = array_slice($copy['faq'], 0, 9);
-        }
-
-        if (is_array($copy['features'])) {
-            foreach ($copy['features'] as $i => $f) {
-                if (!is_array($f)) continue;
-                if (isset($f['p_html'])) $f['p_html'] = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($f['p_html'])));
-                if (isset($f['title'])) $f['title'] = trim(strip_tags($this->toStr($f['title'])));
-                $copy['features'][$i] = $f;
-            }
-        }
-
-        if (is_array($copy['faq'])) {
-            foreach ($copy['faq'] as $i => $q) {
-                if (!is_array($q)) continue;
-                if (isset($q['a_html'])) $q['a_html'] = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($q['a_html'])));
-                if (isset($q['q'])) $q['q'] = trim(strip_tags($this->toStr($q['q'])));
-                $copy['faq'][$i] = $q;
-            }
-        }
-
-        return $copy;
-    }
-
-    private function validateAndFixCopy(array $copy): array
-    {
-        $copy = $this->sanitizeAndNormalizeCopy($copy);
-
-        foreach ([
-            'seo_title','hero_kicker','hero_h1',
-            'kit_h1','pack_h2','price_h2',
-            'clients_label','clients_subtitle','reviews_label','testimonios_title','projects_title',
-            'faq_title','final_cta_h3',
-            'btn_presupuesto','btn_reunion',
-            'kitdigital_bold','btn_kitdigital',
-        ] as $k) {
-            $copy[$k] = $this->requireText($copy[$k] ?? '', $k);
-        }
-
-        foreach (['hero_p_html','kit_p_html','pack_p_html','kitdigital_p_html'] as $k) {
-            $copy[$k] = $this->requireHtml($copy[$k] ?? '', $k);
-        }
-
-        if (!is_array($copy['features']) || count($copy['features']) !== 4) {
-            throw new \RuntimeException('Debe haber EXACTAMENTE 4 features generadas.');
-        }
-        if (!is_array($copy['faq']) || count($copy['faq']) !== 9) {
-            throw new \RuntimeException('Debe haber EXACTAMENTE 9 FAQs generadas.');
-        }
-
-        foreach ($copy['features'] as $i => $f) {
-            if (!is_array($f)) throw new \RuntimeException("Feature inválida index {$i}");
-            $f['title']  = $this->requireText($f['title'] ?? '', "features[$i].title");
-            $f['p_html'] = $this->requireHtml($f['p_html'] ?? '', "features[$i].p_html");
-            $copy['features'][$i] = $f;
-        }
-
-        foreach ($copy['faq'] as $i => $q) {
-            if (!is_array($q)) throw new \RuntimeException("FAQ inválida index {$i}");
-            $q['q']      = $this->requireText($q['q'] ?? '', "faq[$i].q");
-            $q['a_html']  = $this->requireHtml($q['a_html'] ?? '', "faq[$i].a_html");
-            $copy['faq'][$i] = $q;
-        }
-
-        if ($this->violatesSeoHardRules($copy)) {
-            throw new \RuntimeException("El JSON viola reglas SEO/H1");
-        }
-
-        return $copy;
     }
 
     private function violatesSeoHardRules(array $copy): bool
@@ -1092,7 +1349,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // ANTI-REPETICIÓN
+    // Anti-repetición (igual que tu versión)
     // ===========================================================
     private function isTooSimilarToAnyPrevious(array $copy, array $usedTitles, array $usedCorpus): bool
     {
@@ -1110,7 +1367,6 @@ PROMPT;
             if ($corp === '') continue;
             if ($this->jaccardBigrams($text, $corp) >= 0.50) return true;
         }
-
         return false;
     }
 
@@ -1138,9 +1394,7 @@ PROMPT;
         $chars = preg_split('~~u', $s, -1, PREG_SPLIT_NO_EMPTY);
         $out = [];
         $n = count($chars);
-        for ($i = 0; $i < $n - 1; $i++) {
-            $out[$chars[$i] . $chars[$i + 1]] = 1;
-        }
+        for ($i = 0; $i < $n - 1; $i++) $out[$chars[$i] . $chars[$i + 1]] = 1;
         return $out;
     }
 
@@ -1148,7 +1402,6 @@ PROMPT;
     {
         $draftJson = trim((string)$draftJson);
         if ($draftJson === '') return '';
-
         $arr = json_decode($draftJson, true);
         if (!is_array($arr)) return '';
         return $this->copyTextFromArray($arr);
@@ -1183,212 +1436,5 @@ PROMPT;
         $txt = implode(' ', array_filter($parts));
         $txt = preg_replace('~\s+~u', ' ', $txt);
         return trim((string)$txt);
-    }
-
-    // ===========================================================
-    // TOKENS: reemplazo GLOBAL
-    // ===========================================================
-    private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
-    {
-        $copy = $this->validateAndFixCopy($copy);
-
-        $dict = $this->buildPrettyTokenDictionary($copy);
-
-        $replacedCount = 0;
-        $this->replaceTokensDeep($tpl, $dict, $replacedCount);
-
-        $remaining = $this->collectRemainingTokensDeep($tpl);
-
-        return [$tpl, $replacedCount, $remaining];
-    }
-
-    private function replaceTokensDeep(mixed &$node, array $dict, int &$count): void
-    {
-        if (is_array($node)) {
-            foreach ($node as &$v) {
-                $this->replaceTokensDeep($v, $dict, $count);
-            }
-            return;
-        }
-
-        if (!is_string($node) || $node === '') return;
-        if (!str_contains($node, '{{')) return;
-
-        $orig = $node;
-        $node = strtr($node, $dict);
-        if ($node !== $orig) $count++;
-    }
-
-    private function collectRemainingTokensDeep(mixed $node): array
-    {
-        $found = [];
-
-        $walk = function ($n) use (&$walk, &$found) {
-            if (is_array($n)) {
-                foreach ($n as $v) $walk($v);
-                return;
-            }
-            if (!is_string($n) || $n === '') return;
-
-            if (preg_match_all('/\{\{[A-Z0-9_]+\}\}/', $n, $m)) {
-                foreach ($m[0] as $tok) $found[] = $tok;
-            }
-        };
-
-        $walk($node);
-        $found = array_values(array_unique($found));
-        sort($found);
-        return $found;
-    }
-
-    private function buildPrettyTokenDictionary(array $copy): array
-    {
-        $featuresListHtml = $this->buildFeaturesListHtml($copy);
-
-        $dict = [
-            // HERO
-            '{{HERO_KICKER}}' => $this->requireText($copy['hero_kicker'] ?? '', 'hero_kicker'),
-            '{{HERO_H1}}'     => $this->requireText($copy['hero_h1'] ?? '', 'hero_h1'),
-            '{{HERO_P}}'      => $this->requireHtml($copy['hero_p_html'] ?? '', 'hero_p_html'),
-
-            // PACK / precio
-            '{{PACK_H2}}'   => $this->requireText($copy['pack_h2'] ?? '', 'pack_h2'),
-            '{{PACK_P}}'    => $this->requireHtml($copy['pack_p_html'] ?? '', 'pack_p_html'),
-            '{{PRICE_H2}}'  => $this->requireText($copy['price_h2'] ?? '', 'price_h2'),
-
-            // KIT
-            '{{KIT_H1}}' => $this->requireText($copy['kit_h1'] ?? '', 'kit_h1'),
-            '{{KIT_P}}'  => $this->requireHtml($copy['kit_p_html'] ?? '', 'kit_p_html'),
-
-            // FEATURES (incluye FEATURE_3_TITLE)
-            '{{FEATURE_1_TITLE}}' => $this->requireText($copy['features'][0]['title'] ?? '', 'features[0].title'),
-            '{{FEATURE_1_P}}'     => $this->requireHtml($copy['features'][0]['p_html'] ?? '', 'features[0].p_html'),
-
-            '{{FEATURE_2_TITLE}}' => $this->requireText($copy['features'][1]['title'] ?? '', 'features[1].title'),
-            '{{FEATURE_2_P}}'     => $this->requireHtml($copy['features'][1]['p_html'] ?? '', 'features[1].p_html'),
-
-            '{{FEATURE_3_TITLE}}' => $this->requireText($copy['features'][2]['title'] ?? '', 'features[2].title'),
-            '{{FEATURE_3_P}}'     => $this->requireHtml($copy['features'][2]['p_html'] ?? '', 'features[2].p_html'),
-
-            '{{FEATURE_4_TITLE}}' => $this->requireText($copy['features'][3]['title'] ?? '', 'features[3].title'),
-            '{{FEATURE_4_P}}'     => $this->requireHtml($copy['features'][3]['p_html'] ?? '', 'features[3].p_html'),
-
-            '{{FEATURES_LIST_HTML}}' => $featuresListHtml,
-
-            // CLIENTS / REVIEWS / PROJECTS
-            '{{CLIENTS_LABEL}}'     => $this->requireText($copy['clients_label'] ?? '', 'clients_label'),
-            '{{CLIENTS_SUBTITLE}}'  => $this->requireText($copy['clients_subtitle'] ?? '', 'clients_subtitle'),
-            '{{REVIEWS_LABEL}}'     => $this->requireText($copy['reviews_label'] ?? '', 'reviews_label'),
-            '{{TESTIMONIOS_TITLE}}' => $this->requireText($copy['testimonios_title'] ?? '', 'testimonios_title'),
-            '{{PROJECTS_TITLE}}'    => $this->requireText($copy['projects_title'] ?? '', 'projects_title'),
-
-            // FAQ
-            '{{FAQ_TITLE}}' => $this->requireText($copy['faq_title'] ?? '', 'faq_title'),
-
-            // CTA final
-            '{{FINAL_CTA}}' => $this->requireText($copy['final_cta_h3'] ?? '', 'final_cta_h3'),
-
-            // Botones
-            '{{BTN_PRESUPUESTO}}' => $this->requireText($copy['btn_presupuesto'] ?? '', 'btn_presupuesto'),
-            '{{BTN_REUNION}}'     => $this->requireText($copy['btn_reunion'] ?? '', 'btn_reunion'),
-
-            // Kit Digital
-            '{{KITDIGITAL_BOLD}}' => $this->requireText($copy['kitdigital_bold'] ?? '', 'kitdigital_bold'),
-            '{{KITDIGITAL_P}}'    => $this->requireHtml($copy['kitdigital_p_html'] ?? '', 'kitdigital_p_html'),
-            '{{BTN_KITDIGITAL}}'  => $this->requireText($copy['btn_kitdigital'] ?? '', 'btn_kitdigital'),
-        ];
-
-        // FAQ 1..9
-        for ($i = 0; $i < 9; $i++) {
-            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = $this->requireText($copy['faq'][$i]['q'] ?? '', "faq[$i].q");
-            $dict['{{FAQ_' . ($i + 1) . '_A}}'] = $this->requireHtml($copy['faq'][$i]['a_html'] ?? '', "faq[$i].a_html");
-        }
-
-        return $dict;
-    }
-
-    private function buildFeaturesListHtml(array $copy): string
-    {
-        if (!isset($copy['features']) || !is_array($copy['features']) || count($copy['features']) !== 4) {
-            throw new \RuntimeException('No se puede construir FEATURES_LIST_HTML sin 4 features.');
-        }
-
-        $parts = [];
-        for ($i = 0; $i < 4; $i++) {
-            $t = $this->requireText($copy['features'][$i]['title'] ?? '', "features[$i].title");
-            $pTxt = trim(strip_tags($this->toStr($copy['features'][$i]['p_html'] ?? '')));
-            if ($pTxt === '') $pTxt = $t;
-
-            $tSafe = htmlspecialchars($t, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-            $pSafe = htmlspecialchars($pTxt, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-            $parts[] = "<p><strong>{$tSafe}:</strong> {$pSafe}</p>";
-        }
-        return implode('', $parts);
-    }
-
-    // ===========================================================
-    // Post-pass (plantillas viejas) usando JSON (sin texto fijo)
-    // ===========================================================
-    private function forceReplaceStaticTextsInTemplate(array $tpl, array $copy): array
-    {
-        $mapExact = [];
-
-        if (!empty($copy['btn_presupuesto'])) {
-            $to = trim(strip_tags($this->toStr($copy['btn_presupuesto'])));
-            $mapExact["Solicitar presupuesto"] = $to;
-            $mapExact["Pedir presupuesto"] = $to;
-            $mapExact["Solicitar propuesta"] = $to;
-        }
-        if (!empty($copy['btn_reunion'])) {
-            $to = trim(strip_tags($this->toStr($copy['btn_reunion'])));
-            $mapExact["Reservar llamada"] = $to;
-            $mapExact["Agendar reunión"] = $to;
-            $mapExact["Agendar reunion"] = $to;
-            $mapExact["Agendar llamada"] = $to;
-        }
-        if (!empty($copy['final_cta_h3'])) {
-            $mapExact["¿Listo para avanzar con agencias de publicidad?"] = trim(strip_tags($this->toStr($copy['final_cta_h3'])));
-        }
-        if (!empty($copy['btn_kitdigital'])) {
-            $to = trim(strip_tags($this->toStr($copy['btn_kitdigital'])));
-            $mapExact["Acceder al Kit Digital"] = $to;
-            $mapExact["Ver Kit Digital"] = $to;
-            $mapExact["Solicitar Kit Digital"] = $to;
-        }
-
-        $count = 0;
-        if (!empty($mapExact)) {
-            $this->replaceStringsRecursive($tpl, $mapExact, $count);
-        }
-
-        return [$tpl, $count];
-    }
-
-    private function replaceStringsRecursive(mixed &$node, array $mapExact, int &$count): void
-    {
-        if (is_array($node)) {
-            foreach ($node as &$v) {
-                $this->replaceStringsRecursive($v, $mapExact, $count);
-            }
-            return;
-        }
-
-        if (!is_string($node) || $node === '') return;
-
-        $orig = $node;
-        $trim = trim($node);
-
-        if (isset($mapExact[$trim])) {
-            $node = $mapExact[$trim];
-        } else {
-            foreach ($mapExact as $from => $to) {
-                if ($from === '') continue;
-                if (str_contains($node, $from)) {
-                    $node = str_replace($from, $to, $node);
-                }
-            }
-        }
-
-        if ($node !== $orig) $count++;
     }
 }
