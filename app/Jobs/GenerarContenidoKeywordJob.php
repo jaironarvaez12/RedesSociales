@@ -16,12 +16,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public $timeout = 2400;
-
-    // Sube a 3 para que no te lo mate a la primera si DeepSeek devuelve algo cortado
-    public $tries = 3;
-
-    // Backoff progresivo (opcional)
-    public $backoff = [30, 120, 300];
+    public $tries = 1;
 
     public function __construct(
         public string $idDominio,
@@ -152,7 +147,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                     break;
                 }
 
-                // alimentar historial
+                // alimentar historial para variar en el siguiente intento
                 $usedTitles[] = $this->toStr($candidate['seo_title'] ?? $candidate['hero_h1'] ?? '');
                 $usedCorpus[] = $this->copyTextFromArray($candidate);
 
@@ -165,32 +160,26 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             }
 
             // =========================
-            // Elementor template + fill (Pretty Tokens)
+            // Elementor template + fill con TOKENS
             // =========================
             [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
-            [$filled, $replacedCount, $remaining] = $this->fillElementorTemplate_byPrettyTokens_withStats($tpl, $final);
+            [$filled, $tokenReplaceCount, $remainingAfterPass1] = $this->fillElementorTemplate_byPrettyTokens_withStats($tpl, $final);
 
-            // Si no parece tokenizado, te lo digo claro
-            if ($replacedCount < 8) {
-                throw new \RuntimeException("Template no parece tokenizado (replacedCount={$replacedCount}). Template: {$tplPath}");
+            // Si aún quedan tokens, reintenta con fallback global (JSON string)
+            if (count($remainingAfterPass1) > 0) {
+                [$filled, $tokenReplaceCount2, $remainingAfterPass2] = $this->fillElementorTemplate_byPrettyTokens_withStats($filled, $final);
+                $tokenReplaceCount += $tokenReplaceCount2;
+                $remainingAfterPass1 = $remainingAfterPass2;
             }
 
-            // Fallback automático: intenta rellenar tokens restantes con defaults
-            if (count($remaining) > 0) {
-                [$filled, $extra, $remaining2] = $this->fillMissingTokensFallback($filled, $final, $remaining);
-                $replacedCount += $extra;
-                $remaining = $remaining2;
+            if ($tokenReplaceCount < 8) {
+                throw new \RuntimeException("Template no parece tokenizado (tokenReplaceCount={$tokenReplaceCount}). Template: {$tplPath}");
             }
 
-            if (count($remaining) > 0) {
-                throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 50)));
+            if (count($remainingAfterPass1) > 0) {
+                throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remainingAfterPass1, 0, 50)));
             }
-
-            // Post-pass opcional por si quedó texto fijo no tokenizado
-            [$filled, $staticCount] = $this->forceReplaceStaticTextsInTemplate($filled, $final);
-
-            $totalReplacements = $replacedCount + $staticCount;
 
             // =========================
             // Title + slug
@@ -213,9 +202,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 'error' => null,
             ]);
 
-            // (opcional) si quieres guardar métricas:
-            // $registro->update(['meta' => json_encode(['replacements' => $totalReplacements, 'tpl' => $tplPath])]);
-
         } catch (\Throwable $e) {
             $registro->update([
                 'estatus' => 'error',
@@ -226,7 +212,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     }
 
     // ===========================================================
-    // TEMPLATE LOADER (por dominio)
+    // TEMPLATE LOADER (por dominio + fallback env)
     // ===========================================================
     private function loadElementorTemplateForDomainWithPath(int $idDominio): array
     {
@@ -285,7 +271,8 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         float $temperature = 0.90,
         float $topP = 0.92,
         bool $jsonMode = true
-    ): string {
+    ): string
+    {
         $nonce = 'nonce:' . Str::uuid()->toString();
 
         $payload = [
@@ -412,9 +399,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         ];
 
         $out = $skeleton;
-        foreach ($partial as $k => $v) {
-            $out[$k] = $v;
-        }
+        foreach ($partial as $k => $v) $out[$k] = $v;
         return $out;
     }
 
@@ -814,7 +799,33 @@ PROMPT;
     private function validateAndFixCopy(array $copy): array
     {
         $copy = $this->mergeWithSkeleton($copy);
-        $copy = $this->sanitizeAndNormalizeCopy($copy);
+
+        $copy['features'] = isset($copy['features']) && is_array($copy['features']) ? $copy['features'] : [];
+        $copy['faq']      = isset($copy['faq']) && is_array($copy['faq']) ? $copy['faq'] : [];
+
+        $kw = $this->shortKw();
+
+        $copy['hero_h1'] = $this->ensureText($copy['hero_h1'] ?? '', $kw);
+
+        $seo = $this->ensureText($copy['seo_title'] ?? '', $copy['hero_h1']);
+        if (mb_strlen($seo) > 65) {
+            $seo = mb_substr($seo, 0, 65);
+            $seo = rtrim($seo, " \t\n\r\0\x0B-–—|:");
+        }
+        if ($seo === '') $seo = $copy['hero_h1'];
+        $copy['seo_title'] = $seo;
+
+        $copy['kit_h1']       = $this->ensureText($copy['kit_h1'] ?? '', "Kit para {$kw}");
+        $copy['pack_h2']      = $this->ensureText($copy['pack_h2'] ?? '', "Pack de {$kw} listo para publicar");
+        $copy['faq_title']    = $this->ensureText($copy['faq_title'] ?? '', "Preguntas frecuentes sobre {$kw}");
+        $copy['final_cta_h3'] = $this->ensureText($copy['final_cta_h3'] ?? '', "¿Listo para avanzar con {$kw}?");
+
+        $copy['hero_p_html'] = $this->ensureHtml($copy['hero_p_html'] ?? '', "Una solución clara para {$kw} enfocada en conversión.");
+        $copy['kit_p_html']  = $this->ensureHtml($copy['kit_p_html'] ?? '',  "Contenido pensado para implementar rápido en {$kw}.");
+        $copy['pack_p_html'] = $this->ensureHtml($copy['pack_p_html'] ?? '', "Estructura y copy listos, sin huecos ni secciones vacías.");
+
+        $copy['features'] = $this->normalizeFeatures($copy['features'], 4);
+        $copy['faq']      = $this->normalizeFaq($copy['faq'], 9);
 
         if ($this->violatesSeoHardRules($copy)) {
             throw new \RuntimeException("El JSON viola reglas SEO/H1");
@@ -1048,7 +1059,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // Elementor fill por Pretty Tokens (v3)
+    // Elementor fill por TOKENS + stats + fallback global
     // ===========================================================
     private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
     {
@@ -1056,6 +1067,7 @@ PROMPT;
 
         $replacedCount = 0;
 
+        // 1) recorrido normal
         $walk = function (&$nodes) use (&$walk, $dict, &$replacedCount) {
             if (!is_array($nodes)) return;
 
@@ -1074,6 +1086,21 @@ PROMPT;
 
         if (isset($tpl['content']) && is_array($tpl['content'])) {
             $walk($tpl['content']);
+        }
+
+        // 2) fallback global (por si tokens quedan fuera de settings o en estructuras raras)
+        $json = json_encode($tpl, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (is_string($json) && str_contains($json, '{{')) {
+            foreach ($dict as $token => $rep) {
+                if ($token === '') continue;
+                if (str_contains($json, $token)) {
+                    $json = str_replace($token, $rep, $json);
+                }
+            }
+            $decoded = json_decode($json, true);
+            if (is_array($decoded)) {
+                $tpl = $decoded;
+            }
         }
 
         $remaining = $this->collectRemainingPrettyTokens($tpl);
@@ -1095,7 +1122,7 @@ PROMPT;
             $orig = $v;
 
             foreach ($dict as $token => $rep) {
-                if (str_contains($v, $token)) {
+                if ($token !== '' && str_contains($v, $token)) {
                     $v = str_replace($token, $rep, $v);
                 }
             }
@@ -1106,335 +1133,86 @@ PROMPT;
 
     private function collectRemainingPrettyTokens(array $tpl): array
     {
-        $found = [];
+        $json = json_encode($tpl, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (!is_string($json) || $json === '') return [];
 
-        $content = $tpl['content'] ?? [];
-        $walk = function ($nodes) use (&$walk, &$found) {
-            if (!is_array($nodes)) return;
-
-            foreach ($nodes as $n) {
-                if (!is_array($n)) continue;
-
-                if (isset($n['settings']) && is_array($n['settings'])) {
-                    $this->scanStringsForTokens($n['settings'], $found);
-                }
-
-                if (!empty($n['elements']) && is_array($n['elements'])) {
-                    $walk($n['elements']);
-                }
-            }
-        };
-
-        $walk($content);
-
+        preg_match_all('/\{\{[A-Z0-9_]+\}\}/', $json, $m);
+        $found = $m[0] ?? [];
         $found = array_values(array_unique($found));
         sort($found);
         return $found;
     }
 
-    private function scanStringsForTokens(array $arr, array &$found): void
-    {
-        foreach ($arr as $v) {
-            if (is_array($v)) {
-                $this->scanStringsForTokens($v, $found);
-                continue;
-            }
-            if (!is_string($v) || $v === '') continue;
-
-            if (preg_match_all('/\{\{[A-Z0-9_]+\}\}/', $v, $m)) {
-                foreach ($m[0] as $tok) $found[] = $tok;
-            }
-        }
-    }
-
     private function buildPrettyTokenDictionary(array $copy): array
     {
-        // OJO: aquí meto TODOS los tokens de tus plantillas v3
         $kw = $this->shortKw();
 
-        $heroH1 = $this->ensureText($copy['hero_h1'] ?? $kw, $kw);
-        $heroP  = $this->ensureHtml($copy['hero_p_html'] ?? '', "Una solución clara para {$kw} enfocada en conversión.");
+        $txt = fn($v) => trim(strip_tags($this->toStr($v)));
+        $html = fn($v) => $this->toStr($v);
 
-        $kitH1  = $this->ensureText($copy['kit_h1'] ?? "Kit para {$kw}", "Kit para {$kw}");
-        $kitP   = $this->ensureHtml($copy['kit_p_html'] ?? '', "Contenido pensado para implementar rápido en {$kw}.");
-
-        $packH2 = $this->ensureText($copy['pack_h2'] ?? "Pack de {$kw}", "Pack de {$kw}");
-        $packP  = $this->ensureHtml($copy['pack_p_html'] ?? '', "Estructura y copy listos, sin huecos ni secciones vacías.");
-
-        $faqT   = $this->ensureText($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}", "Preguntas frecuentes sobre {$kw}");
-        $cta    = $this->ensureText($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?", "¿Listo para avanzar con {$kw}?");
-
-        // Kit Digital (sección fija que querías que cambie)
-        $kitDigitalTitle = $this->pick([
-            "Crea tu Web con el Kit Digital",
-            "Kit Digital: tu web lista para captar clientes",
-            "Activa el Kit Digital y lanza tu web",
-        ]);
-
-        $kitDigitalP = $this->pick([
-            "Consigue tu página web sin coste con el bono digital. Te ayudamos a solicitar la ayuda y lanzamos tu negocio online.",
-            "Te guiamos para solicitar el bono y dejamos tu web lista para publicar, con estructura y mensajes orientados a conversión.",
-            "Tramitamos contigo el bono y construimos una web clara y rápida, enfocada en captar contactos desde el primer día.",
-        ]);
-
-        $kitDigitalBold = $this->pick([
-            "Autónomos y Pymes ➝ Diseño web, eCommerce y SEO. 100% Subvencionado.",
-            "Autónomos y Pymes ➝ Web, eCommerce y SEO con bono Kit Digital.",
-            "Autónomos y Pymes ➝ Lanzamiento web + base SEO con Kit Digital.",
-        ]);
+        $heroH1 = $txt($copy['hero_h1'] ?? $kw);
+        $heroP  = $html($copy['hero_p_html'] ?? "<p></p>");
+        $kitH1  = $txt($copy['kit_h1'] ?? "Kit para {$kw}");
+        $kitP   = $html($copy['kit_p_html'] ?? "<p></p>");
+        $packH2 = $txt($copy['pack_h2'] ?? "Pack de {$kw}");
+        $packP  = $html($copy['pack_p_html'] ?? "<p></p>");
+        $faqT   = $txt($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}");
+        $cta    = $txt($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?");
 
         $dict = [
-            // HERO
-            '{{HERO_KICKER}}' => $this->pick([
-                "Sitio web corporativo",
-                "Web corporativa profesional",
-                "Web orientada a captar clientes",
-                "Diseño web con enfoque comercial",
-            ]),
-            '{{HERO_H1}}' => $heroH1,
-            '{{HERO_P}}'  => $heroP,
+            // Hero / secciones fijas
+            '{{HERO_KICKER}}' => $this->pick(["Sitio web corporativo","Diseño web profesional","Web para captar clientes"]),
+            '{{HERO_H1}}'     => $heroH1,
+            '{{HERO_P}}'      => $heroP,
 
-            // CLIENTES / REVIEWS / PROYECTOS
-            '{{CLIENTS_LABEL}}' => $this->pick(["Clientes","Marcas","Empresas","Negocios"]),
-            '{{CLIENTS_SUBTITLE}}' => $this->pick([
-                "Empresas en toda España y el mundo ya confían en nosotros",
-                "Equipos que apuestan por rendimiento y claridad",
-                "Negocios que buscan resultados ya trabajan con nosotros",
-            ]),
-            '{{REVIEWS_LABEL}}' => $this->pick(["Opiniones","Reseñas","Valoraciones"]),
-            '{{TESTIMONIOS_TITLE}}' => $this->pick(["Testimonios","Experiencias de clientes","Lo que dicen de nosotros"]),
-            '{{PROJECTS_TITLE}}' => $this->pick([
-                "Proyectos Web Realizados: Diseño, Desarrollo y Resultados",
-                "Trabajos publicados: estructura, rendimiento y conversión",
-                "Casos de web: ejecución clara y enfoque a resultados",
-            ]),
-
-            // KIT / PACK
+            // Kit
             '{{KIT_H1}}' => $kitH1,
             '{{KIT_P}}'  => $kitP,
+            // extra línea/claim del kit (si lo usas en plantilla)
+            '{{KIT_P2}}' => $this->keepAllowedInlineHtml("<p><strong>Autónomos y Pymes:</strong> diseño web, eCommerce y SEO. Subvencionado según convocatoria.</p>"),
+
+            // Pack
             '{{PACK_H2}}' => $packH2,
             '{{PACK_P}}'  => $packP,
 
-            // FAQ / CTA
+            // FAQ
             '{{FAQ_TITLE}}' => $faqT,
             '{{FINAL_CTA}}' => $cta,
 
-            // BOTONES
+            // Clientes / Reviews
+            '{{CLIENTS_LABEL}}'    => $this->pick(["Clientes","Marcas","Empresas"]),
+            '{{CLIENTS_SUBTITLE}}' => $this->pick([
+                "Empresas en toda España y el mundo ya confían en nosotros",
+                "Negocios que buscan resultados ya trabajan con nosotros",
+                "Equipos que apuestan por rendimiento y claridad",
+            ]),
+            '{{REVIEWS_LABEL}}'     => $this->pick(["Opiniones","Reseñas","Valoraciones"]),
+            '{{TESTIMONIOS_TITLE}}' => $this->pick(["Testimonios","Lo que dicen de nosotros","Experiencias de clientes"]),
+            '{{PROJECTS_TITLE}}'    => $this->pick([
+                "Proyectos Web Realizados: Diseño, Desarrollo y Resultados",
+                "Casos de web: estructura, rendimiento y conversión",
+                "Trabajos recientes: enfoque y ejecución",
+            ]),
+
+            // Botones
             '{{BTN_PRESUPUESTO}}' => $this->pick(["Solicitar presupuesto","Pedir presupuesto","Solicitar propuesta"]),
             '{{BTN_REUNION}}'     => $this->pick(["Reservar llamada","Agendar reunión","Agendar llamada"]),
-
-            // KIT DIGITAL (NUEVO)
-            '{{KITDIGITAL_TITLE}}' => $kitDigitalTitle,
-            '{{KITDIGITAL_P}}'     => $kitDigitalP,
-            '{{KITDIGITAL_BOLD}}'  => $kitDigitalBold,
-            '{{BTN_KITDIGITAL}}'   => $this->pick(["Acceder al kit digital","Ver Kit Digital","Solicitar Kit Digital"]),
+            '{{BTN_KITDIGITAL}}'  => $this->pick(["Acceder al kit digital","Ver kit digital","Solicitar kit digital"]),
         ];
 
         // FEATURES 1..4
-        for ($i = 0; $i < 4; $i++) {
-            $dict['{{FEATURE_' . ($i + 1) . '_TITLE}}'] =
-                $this->ensureText($copy['features'][$i]['title'] ?? "", "Beneficio " . ($i + 1) . " para {$kw}");
-
-            $dict['{{FEATURE_' . ($i + 1) . '_P}}'] =
-                $this->ensureHtml($copy['features'][$i]['p_html'] ?? "", "Aporta claridad y conversión para {$kw}.");
+        for ($i=0; $i<4; $i++) {
+            $dict['{{FEATURE_'.($i+1).'_TITLE}}'] = $txt($copy['features'][$i]['title'] ?? "Beneficio ".($i+1)." para {$kw}");
+            $dict['{{FEATURE_'.($i+1).'_P}}']     = $html($copy['features'][$i]['p_html'] ?? "<p></p>");
         }
 
         // FAQ 1..9
-        for ($i = 0; $i < 9; $i++) {
-            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] =
-                $this->ensureText($copy['faq'][$i]['q'] ?? "", "Pregunta " . ($i + 1) . " sobre {$kw}");
-
-            $dict['{{FAQ_' . ($i + 1) . '_A}}'] =
-                $this->ensureHtml($copy['faq'][$i]['a_html'] ?? "", "Respuesta clara y accionable sobre {$kw}.");
+        for ($i=0; $i<9; $i++) {
+            $dict['{{FAQ_'.($i+1).'_Q}}'] = $txt($copy['faq'][$i]['q'] ?? "Pregunta ".($i+1)." sobre {$kw}");
+            $dict['{{FAQ_'.($i+1).'_A}}'] = $html($copy['faq'][$i]['a_html'] ?? "<p></p>");
         }
 
         return $dict;
-    }
-
-    /**
-     * Fallback: si quedan tokens, los intenta completar sí o sí con defaults
-     */
-    private function fillMissingTokensFallback(array $tpl, array $copy, array $remainingTokens): array
-    {
-        $dictBase = $this->buildPrettyTokenDictionary($copy);
-
-        // Asegura que cualquier token que quede tenga algún reemplazo
-        foreach ($remainingTokens as $tok) {
-            if (isset($dictBase[$tok])) continue;
-
-            // Defaults genéricos por patrón
-            if (preg_match('/^\{\{FAQ_(\d+)_Q\}\}$/', $tok, $m)) {
-                $dictBase[$tok] = "Pregunta frecuente sobre " . $this->shortKw();
-                continue;
-            }
-            if (preg_match('/^\{\{FAQ_(\d+)_A\}\}$/', $tok, $m)) {
-                $dictBase[$tok] = "<p>Respuesta clara y lista para publicar sobre {$this->shortKw()}.</p>";
-                continue;
-            }
-            if (preg_match('/^\{\{FEATURE_(\d+)_TITLE\}\}$/', $tok, $m)) {
-                $dictBase[$tok] = "Mejora clave para " . $this->shortKw();
-                continue;
-            }
-            if (preg_match('/^\{\{FEATURE_(\d+)_P\}\}$/', $tok, $m)) {
-                $dictBase[$tok] = "<p><strong>Qué aporta:</strong> más claridad y conversión, sin relleno.</p>";
-                continue;
-            }
-
-            // Default final
-            $dictBase[$tok] = $this->shortKw();
-        }
-
-        $extra = 0;
-
-        $walk = function (&$nodes) use (&$walk, $dictBase, &$extra) {
-            if (!is_array($nodes)) return;
-
-            foreach ($nodes as &$n) {
-                if (!is_array($n)) continue;
-
-                if (isset($n['settings']) && is_array($n['settings'])) {
-                    $this->replacePrettyTokensRecursive($n['settings'], $dictBase, $extra);
-                }
-
-                if (!empty($n['elements']) && is_array($n['elements'])) {
-                    $walk($n['elements']);
-                }
-            }
-        };
-
-        if (isset($tpl['content']) && is_array($tpl['content'])) {
-            $walk($tpl['content']);
-        }
-
-        $remaining2 = $this->collectRemainingPrettyTokens($tpl);
-
-        return [$tpl, $extra, $remaining2];
-    }
-
-    // ===========================================================
-    // Post-pass: reemplaza textos fijos que NO estén tokenizados
-    // ===========================================================
-    private function forceReplaceStaticTextsInTemplate(array $tpl, array $copy): array
-    {
-        $kw = $this->shortKw();
-
-        $btnPresupuesto = $this->pick([
-            'Solicitar presupuesto',
-            'Pedir presupuesto',
-            'Solicitar propuesta',
-            'Pedir propuesta',
-            'Quiero presupuesto',
-        ]);
-
-        $btnReunion = $this->pick([
-            'Agendar reunión',
-            'Reservar llamada',
-            'Agendar llamada',
-            'Hablar con un experto',
-        ]);
-
-        $headlineHero = $this->pick([
-            "Más que una web: una herramienta para captar clientes",
-            "Tu web como motor de clientes (no solo diseño)",
-            "Una web pensada para convertir visitas en contactos",
-            "Web enfocada en resultados, velocidad y conversión",
-        ]);
-
-        $clientesSub = $this->pick([
-            "Empresas en España y fuera ya confían en nosotros",
-            "Marcas de distintos sectores ya trabajan con nosotros",
-            "Negocios que buscan resultados ya han confiado en este servicio",
-            "Equipos en crecimiento ya apuestan por conversión",
-        ]);
-
-        $opinionesTitle = $this->pick(['Opiniones', 'Reseñas', 'Valoraciones']);
-        $testimoniosTitle = $this->pick(['Testimonios', 'Lo que dicen nuestros clientes', 'Experiencias de clientes']);
-
-        $proyectosTitle = $this->pick([
-            "Proyectos web: diseño, desarrollo y resultados",
-            "Trabajos realizados: estructura, rendimiento y conversión",
-            "Casos de web: lo que se construye y lo que se consigue",
-            "Proyectos web publicados: enfoque y ejecución",
-        ]);
-
-        $ctaFinal = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? '')));
-        if ($ctaFinal === '') $ctaFinal = "¿Listo para avanzar con {$kw}?";
-
-        $mapExact = [
-            "Sitio web corporativo" => $this->pick([
-                "Web corporativa profesional",
-                "Sitio corporativo optimizado",
-                "Web corporativa enfocada en conversión",
-                "Página corporativa de alto rendimiento",
-            ]),
-            "Más Que Una Web, Una Herramienta Para Captar Nuevos Clientes" => $headlineHero,
-            "Más que una web, una herramienta para captar nuevos clientes" => $headlineHero,
-            "Clientes" => $this->pick(["Clientes", "Marcas", "Empresas", "Negocios"]),
-            "Empresas en toda España y el mundo ya confían en nosotros" => $clientesSub,
-            "Equipos que apuestan por rendimiento y claridad" => $clientesSub,
-            "Opiniones" => $opinionesTitle,
-            "Testimonios" => $testimoniosTitle,
-            "Proyectos Web Realizados: Diseño, Desarrollo y Resultados que Hablan por Sí Solos" => $proyectosTitle,
-
-            "Solicitar presupuesto" => $btnPresupuesto,
-            "Solicitar propuesta" => $btnPresupuesto,
-            "Agendar reunion" => $btnReunion,
-            "Agendar reunión" => $btnReunion,
-            "Reservar llamada" => $btnReunion,
-
-            "¿Listo para avanzar con agencias de publicidad?" => $ctaFinal,
-        ];
-
-        $count = 0;
-
-        $walk = function (&$nodes) use (&$walk, $mapExact, &$count) {
-            if (!is_array($nodes)) return;
-
-            foreach ($nodes as &$n) {
-                if (!is_array($n)) continue;
-
-                if (isset($n['settings']) && is_array($n['settings'])) {
-                    $this->replaceStringsRecursive($n['settings'], $mapExact, $count);
-                }
-
-                if (!empty($n['elements']) && is_array($n['elements'])) {
-                    $walk($n['elements']);
-                }
-            }
-        };
-
-        if (isset($tpl['content']) && is_array($tpl['content'])) {
-            $walk($tpl['content']);
-        }
-
-        return [$tpl, $count];
-    }
-
-    private function replaceStringsRecursive(array &$arr, array $mapExact, int &$count): void
-    {
-        foreach ($arr as $k => &$v) {
-            if (is_array($v)) {
-                $this->replaceStringsRecursive($v, $mapExact, $count);
-                continue;
-            }
-            if (!is_string($v)) continue;
-
-            $orig = $v;
-
-            $trim = trim($v);
-            if (isset($mapExact[$trim])) {
-                $v = $mapExact[$trim];
-            } else {
-                foreach ($mapExact as $from => $to) {
-                    if ($from === '') continue;
-                    if (str_contains($v, $from)) {
-                        $v = str_replace($from, $to, $v);
-                    }
-                }
-            }
-
-            if ($v !== $orig) $count++;
-        }
     }
 
     private function pick(array $arr): string
