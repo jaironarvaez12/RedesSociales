@@ -90,32 +90,34 @@ class DominiosController extends Controller
     /**
      * Update the specified resource in storage.
      */
-    public function update(Request $request, string $id)
+   public function update(Request $request, string $id)
     {
-        //dd($request);
-        try
-        { 
-              $dominios = DominiosModel::find($id);
-        
+        try {
+            $dominios = DominiosModel::findOrFail($id);
 
+            // (Opcional pero recomendado)
+            $request->validate([
+                'usuario' => ['nullable','string','max:255'],
+                'password' => ['nullable','string','max:255'],
+                'elementor_template_path' => ['nullable','string','max:255'],
+            ]);
 
             $dominios->fill([
-                'usuario' => $request['usuario'],
-              
-            
-              
-             ]);
-           // dd($dominios);
-           if ($request->filled('password')) {
+                'usuario' => $request->input('usuario'),
+                'elementor_template_path' => $request->input('elementor_template_path'), // 👈 NUEVO
+            ]);
+
+            if ($request->filled('password')) {
                 $dominios->password = Crypt::encryptString($request->input('password'));
             }
-               $dominios->save(); //actualizar usuario
 
+            $dominios->save();
+
+        } catch (\Throwable $ex) {
+            return redirect()->back()
+                ->withError('Ha Ocurrido Un Error Al Actualizar El Dominio ' . $ex->getMessage())
+                ->withInput();
         }
-        catch(Exception $ex)
-            {
-                return redirect()->back()->withError('Ha Ocurrido Un Error Al Actualizar El Dominio '.$ex->getMessage())->withInput();
-            }
 
         return redirect()->route('dominios.edit', $id)->withSuccess('El Dominio Se Ha Actualizado Exitosamente');
     }

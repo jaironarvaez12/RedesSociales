@@ -64,7 +64,35 @@
                                     </label>
                                       <input type="password" class="form-control radius-8" id="password" name="password" placeholder="Ingrese su contraseña ">
                                 </div>
+                                @php
+                                // Opciones: puedes moverlo a config/elementor.php si quieres.
+                                $plantillas = [
+                                    'elementor/elementor-64.json' => 'Plantilla 64 (Servicios + FAQ)',
+                                    'elementor/elementor-65.json' => 'Plantilla 65 (Corporativa)',
+                                    'elementor/elementor-landing.json' => 'Landing (CTA fuerte)',
+                                ];
 
+                                $selectedTpl = old('elementor_template_path', $dominio->elementor_template_path ?? '');
+                                @endphp
+
+                                <div class="mb-20">
+                                    <label for="elementor_template_path" class="form-label fw-semibold text-primary-light text-sm mb-8">
+                                        Plantilla Elementor
+                                    </label>
+
+                                    <select class="form-control radius-8" id="elementor_template_path" name="elementor_template_path">
+                                        <option value="">(Usar plantilla por defecto del sistema)</option>
+                                        @foreach($plantillas as $path => $label)
+                                            <option value="{{ $path }}" {{ $selectedTpl === $path ? 'selected' : '' }}>
+                                                {{ $label }}
+                                            </option>
+                                        @endforeach
+                                    </select>
+
+                                    <small class="text-muted">
+                                        Se usará esta plantilla cuando el Job genere contenido para este dominio.
+                                    </small>
+                                </div>
                                 <div class="d-flex align-items-center justify-content-center gap-3 mt-4">
                                     <button type="button"
                                             onclick="window.location.href='{{ route('inicio') }}'"
