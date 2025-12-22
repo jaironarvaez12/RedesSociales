@@ -2,13 +2,14 @@
 
 namespace App\Jobs;
 
+use App\Models\DominiosModel;
+use App\Models\Dominios_Contenido_DetallesModel;
 use Illuminate\Bus\Queueable;
-use Illuminate\Support\Facades\Http;
-use Illuminate\Queue\SerializesModels;
-use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
-use App\Models\Dominios_Contenido_DetallesModel;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
 class GenerarContenidoKeywordJob implements ShouldQueue
@@ -16,7 +17,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public $timeout = 2400;
-    public $tries = 1;
+    public $tries = 1; // OJO: si tu worker corre con --tries=3, reintentará igual.
 
     public function __construct(
         public string $idDominio,
@@ -160,31 +161,29 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             }
 
             // =========================
-            // Elementor template + fill (IDs) + post-pass replace
+            // Cargar plantilla por dominio + REEMPLAZAR TOKENS BONITOS
             // =========================
-           [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
+            [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
-
+            // 1) reemplazo por tokens {{...}}
             [$filled, $replacedCount, $remaining] = $this->fillElementorTemplate_byPrettyTokens_withStats($tpl, $final);
 
-            if ($replacedCount < 8) {
-                throw new \RuntimeException("Template no parece tokenizado (replacedCount={$replacedCount}).");
+            // Si aquí da 0-2, casi seguro NO estás usando *-pretty.json
+            if ($replacedCount < 5) {
+                throw new \RuntimeException("Template no parece tokenizado (replacedCount={$replacedCount}). Usa elementor-64-pretty.json / elementor-65-pretty.json. Template: {$tplPath}");
             }
 
-            if (count($remaining) > 0) {
-                throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 25)));
+            // Si quedaron tokens, NO publiques contenido con huecos
+            if (!empty($remaining)) {
+                throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 30)) . " (template={$tplPath})");
             }
 
-            // Post-pass: reemplaza textos fijos que no estén en los IDs mapeados
-            [$filled, $replacedCount] = $this->forceReplaceStaticTextsInTemplate($filled, $final);
+            // 2) post-pass extra por si hay textos fijos no tokenizados
+            [$filled, $staticCount] = $this->forceReplaceStaticTextsInTemplate($filled, $final);
 
-            // sanity (depende del template; normalmente > 20)
-            if ($setCount < 20) {
-                throw new \RuntimeException(
-                    "Elementor se rellenó parcialmente (setCount={$setCount}). " .
-                    "Template cargado: {$tplPath}. " .
-                    "IDs detectados (sample): " . implode(',', $idsSample)
-                );
+            $totalReplacements = $replacedCount + $staticCount;
+            if ($totalReplacements < 8) {
+                throw new \RuntimeException("Pocos reemplazos totales (total={$totalReplacements}, pretty={$replacedCount}, static={$staticCount}). Template: {$tplPath}");
             }
 
             // =========================
@@ -215,47 +214,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             ]);
             throw $e;
         }
-    }
-
-    // ===========================================================
-    // TEMPLATE LOADER (+ path real)
-    // ===========================================================
-    private function loadElementorTemplateFromStorageWithPath(): array
-    {
-        $templateRel = (string) env('ELEMENTOR_TEMPLATE_PATH', '');
-        if ($templateRel === '') {
-            throw new \RuntimeException('ELEMENTOR_TEMPLATE_PATH no configurado. Ej: elementor/elementor-64.json');
-        }
-
-        $templateRel = trim($templateRel);
-        $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
-
-        if (preg_match('~^https?://~i', $templateRel)) {
-            $u = parse_url($templateRel);
-            $templateRel = $u['path'] ?? $templateRel;
-        }
-
-        $templateRel = preg_replace('~^/?storage/app/~i', '', $templateRel);
-        $templateRel = ltrim(str_replace('\\', '/', $templateRel), '/');
-
-        if (str_contains($templateRel, '..')) {
-            throw new \RuntimeException('ELEMENTOR_TEMPLATE_PATH inválido (no se permite "..")');
-        }
-
-        $templatePath = storage_path('app/' . $templateRel);
-
-        if (!is_file($templatePath)) {
-            throw new \RuntimeException("No existe el template Elementor en disco: {$templatePath} (ELEMENTOR_TEMPLATE_PATH={$templateRel})");
-        }
-
-        $raw = (string) file_get_contents($templatePath);
-        $tpl = json_decode($raw, true);
-
-        if (!is_array($tpl) || !isset($tpl['content']) || !is_array($tpl['content'])) {
-            throw new \RuntimeException('Template Elementor inválido: debe contener "content" (array).');
-        }
-
-        return [$tpl, $templatePath];
     }
 
     // ===========================================================
@@ -1093,154 +1051,217 @@ PROMPT;
     }
 
     // ===========================================================
-    // Elementor fill (IDs v64) + stats + HARD FAIL missing/blank
+    // TEMPLATE LOADER por dominio
     // ===========================================================
-    private function fillElementorTemplate_v64_withStats(array $tpl, array $copy): array
+    private function loadElementorTemplateForDomainWithPath(int $idDominio): array
     {
-        $setCount = 0;
-        $missing = [];
-        $blank = [];
+        $dominio = DominiosModel::where('id_dominio', $idDominio)->first();
+        if (!$dominio) {
+            throw new \RuntimeException("Dominio no encontrado (id={$idDominio})");
+        }
 
-        $allWidgetIds = $this->collectWidgetIds($tpl['content'] ?? []);
-        $sample = array_slice($allWidgetIds, 0, 18);
+        $templateRel = trim((string)($dominio->elementor_template_path ?? ''));
+        if ($templateRel === '') {
+            $templateRel = trim((string) env('ELEMENTOR_TEMPLATE_PATH', ''));
+        }
 
-        $set = function(string $id, string $key, mixed $value, string $label) use (&$tpl, &$setCount, &$missing, &$blank): void {
-            $found = false;
-            $valueStr = $this->toStr($value);
+        if ($templateRel === '') {
+            throw new \RuntimeException('No hay plantilla configurada (dominio ni env ELEMENTOR_TEMPLATE_PATH).');
+        }
 
-            $walk = function (&$nodes) use (&$walk, $id, $key, $valueStr, &$setCount, &$found): void {
-                if (!is_array($nodes)) return;
-                foreach ($nodes as &$n) {
-                    if (is_array($n) && ($n['id'] ?? null) === $id && ($n['elType'] ?? null) === 'widget') {
-                        if (!isset($n['settings']) || !is_array($n['settings'])) $n['settings'] = [];
-                        $n['settings'][$key] = $valueStr;
-                        $setCount++;
-                        $found = true;
-                        return;
-                    }
-                    if (!empty($n['elements']) && is_array($n['elements'])) {
-                        $walk($n['elements']);
-                        if ($found) return;
-                    }
+        $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
+
+        if (preg_match('~^https?://~i', $templateRel)) {
+            $u = parse_url($templateRel);
+            $templateRel = $u['path'] ?? $templateRel;
+        }
+
+        $templateRel = preg_replace('~^/?storage/app/~i', '', $templateRel);
+        $templateRel = ltrim(str_replace('\\', '/', $templateRel), '/');
+
+        if (str_contains($templateRel, '..')) {
+            throw new \RuntimeException('Template path inválido (no se permite "..")');
+        }
+
+        $templatePath = storage_path('app/' . $templateRel);
+
+        if (!is_file($templatePath)) {
+            throw new \RuntimeException("No existe el template en disco: {$templatePath} (path={$templateRel})");
+        }
+
+        $raw = (string) file_get_contents($templatePath);
+        $tpl = json_decode($raw, true);
+
+        if (!is_array($tpl) || !isset($tpl['content']) || !is_array($tpl['content'])) {
+            throw new \RuntimeException('Template Elementor inválido: debe contener "content" (array).');
+        }
+
+        return [$tpl, $templatePath];
+    }
+
+    // ===========================================================
+    // Opción 1: reemplazo por tokens bonitos {{...}}
+    // ===========================================================
+    private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
+    {
+        $dict = $this->buildPrettyTokenDictionary($copy);
+        $replacedCount = 0;
+
+        $walk = function (&$nodes) use (&$walk, $dict, &$replacedCount) {
+            if (!is_array($nodes)) return;
+
+            foreach ($nodes as &$n) {
+                if (!is_array($n)) continue;
+
+                if (isset($n['settings']) && is_array($n['settings'])) {
+                    $this->replacePrettyTokensRecursive($n['settings'], $dict, $replacedCount);
                 }
-            };
 
-            $walk($tpl['content']);
+                if (!empty($n['elements']) && is_array($n['elements'])) {
+                    $walk($n['elements']);
+                }
+            }
+        };
 
-            if (!$found) {
-                $missing[] = "{$label} (id={$id}, key={$key})";
-                return;
+        $walk($tpl['content']);
+
+        $remaining = $this->collectRemainingPrettyTokens($tpl);
+        return [$tpl, $replacedCount, $remaining];
+    }
+
+    private function replacePrettyTokensRecursive(array &$arr, array $dict, int &$count): void
+    {
+        foreach ($arr as $k => &$v) {
+            if (is_array($v)) {
+                $this->replacePrettyTokensRecursive($v, $dict, $count);
+                continue;
             }
 
-            $isEmpty = ($key === 'editor') ? $this->isBlankHtml($valueStr) : $this->isBlankText($valueStr);
-            if ($isEmpty) $blank[] = "{$label} (id={$id})";
-        };
+            if (!is_string($v) || $v === '') continue;
+            if (!str_contains($v, '{{')) continue;
 
-        $mutateWidget = function(string $widgetId, callable $fn, string $label) use (&$tpl, &$setCount, &$missing): void {
-            $found = false;
+            $orig = $v;
 
-            $walk = function (&$nodes) use (&$walk, $widgetId, $fn, &$setCount, &$found): void {
-                if (!is_array($nodes)) return;
-                foreach ($nodes as &$n) {
-                    if (($n['id'] ?? null) === $widgetId && ($n['elType'] ?? null) === 'widget') {
-                        $fn($n);
-                        $setCount++;
-                        $found = true;
-                        return;
-                    }
-                    if (!empty($n['elements']) && is_array($n['elements'])) {
-                        $walk($n['elements']);
-                        if ($found) return;
-                    }
+            foreach ($dict as $token => $rep) {
+                if (str_contains($v, $token)) {
+                    $v = str_replace($token, $rep, $v);
                 }
-            };
+            }
 
-            $walk($tpl['content']);
+            if ($v !== $orig) $count++;
+        }
+    }
 
-            if (!$found) $missing[] = "{$label} (widgetId={$widgetId})";
+    private function collectRemainingPrettyTokens(array $tpl): array
+    {
+        $found = [];
+
+        $walk = function ($nodes) use (&$walk, &$found) {
+            if (!is_array($nodes)) return;
+
+            foreach ($nodes as $n) {
+                if (!is_array($n)) continue;
+
+                if (isset($n['settings']) && is_array($n['settings'])) {
+                    $this->scanStringsForTokens($n['settings'], $found);
+                }
+
+                if (!empty($n['elements']) && is_array($n['elements'])) {
+                    $walk($n['elements']);
+                }
+            }
         };
 
-        // HERO
-        $set('abf38f1', 'title',  $copy['hero_h1'] ?? '', 'hero_h1');
-        $set('6963d8c', 'editor', $copy['hero_p_html'] ?? '', 'hero_p_html');
+        $walk($tpl['content'] ?? []);
 
-        // FEATURES (4)
-        $featureMap = [
-            ['titleId' => '16f38f4b', 'pId' => '5eee828c'],
-            ['titleId' => '5f10c9b8', 'pId' => '52724b49'],
-            ['titleId' => '49e95e7a', 'pId' => '41045e3'],
-            ['titleId' => '23fe29c9', 'pId' => '71aab096'],
+        $found = array_values(array_unique($found));
+        sort($found);
+        return $found;
+    }
+
+    private function scanStringsForTokens(array $arr, array &$found): void
+    {
+        foreach ($arr as $v) {
+            if (is_array($v)) {
+                $this->scanStringsForTokens($v, $found);
+                continue;
+            }
+            if (!is_string($v) || $v === '') continue;
+
+            if (preg_match_all('/\{\{[A-Z0-9_]+\}\}/', $v, $m)) {
+                foreach ($m[0] as $tok) $found[] = $tok;
+            }
+        }
+    }
+
+    private function buildPrettyTokenDictionary(array $copy): array
+    {
+        $kw = $this->shortKw();
+
+        $txt  = fn($v) => trim(strip_tags($this->toStr($v)));
+        $html = fn($v, $fb) => $this->ensureHtml($v, $fb);
+
+        $heroH1 = $txt($copy['hero_h1'] ?? $kw);
+        $heroP  = $html($copy['hero_p_html'] ?? '', "Una solución clara para {$kw} enfocada en conversión.");
+        $kitH1  = $txt($copy['kit_h1'] ?? "Kit para {$kw}");
+        $kitP   = $html($copy['kit_p_html'] ?? '', "Contenido pensado para implementar rápido en {$kw}.");
+        $packH2 = $txt($copy['pack_h2'] ?? "Pack de {$kw}");
+        $packP  = $html($copy['pack_p_html'] ?? '', "Estructura y copy listos, sin huecos ni secciones vacías.");
+        $faqT   = $txt($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}");
+        $cta    = $txt($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?");
+
+        $dict = [
+            '{{HERO_KICKER}}' => $this->pick(["Sitio web corporativo","Diseño web profesional","Web para captar clientes"]),
+            '{{HERO_H1}}'     => $heroH1,
+            '{{HERO_P}}'      => $heroP,
+
+            '{{KIT_H1}}' => $kitH1,
+            '{{KIT_P}}'  => $kitP,
+
+            '{{PACK_H2}}' => $packH2,
+            '{{PACK_P}}'  => $packP,
+
+            '{{FAQ_TITLE}}' => $faqT,
+            '{{FINAL_CTA}}' => $cta,
+
+            '{{CLIENTS_LABEL}}'    => $this->pick(["Clientes","Marcas","Empresas","Negocios"]),
+            '{{CLIENTS_SUBTITLE}}' => $this->pick([
+                "Empresas en toda España y el mundo ya confían en nosotros",
+                "Negocios que buscan resultados ya trabajan con nosotros",
+                "Equipos que apuestan por rendimiento y claridad",
+            ]),
+            '{{REVIEWS_LABEL}}'     => $this->pick(["Opiniones","Reseñas","Valoraciones"]),
+            '{{TESTIMONIOS_TITLE}}' => $this->pick(["Testimonios","Lo que dicen de nosotros","Experiencias reales"]),
+            '{{PROJECTS_TITLE}}'    => $this->pick([
+                "Proyectos Web Realizados: Diseño, Desarrollo y Resultados",
+                "Casos de éxito: webs listas para convertir",
+                "Trabajos recientes: estructura, diseño y conversión",
+            ]),
+
+            '{{BTN_PRESUPUESTO}}' => $this->pick(["Solicitar presupuesto","Pedir presupuesto","Solicitar propuesta"]),
+            '{{BTN_REUNION}}'     => $this->pick(["Agendar reunión","Reservar llamada","Agendar llamada"]),
         ];
-        foreach ($featureMap as $i => $m) {
-            $set($m['titleId'], 'title',  $copy['features'][$i]['title'] ?? '', "feature{$i}_title");
-            $set($m['pId'],     'editor', $copy['features'][$i]['p_html'] ?? '', "feature{$i}_p");
+
+        for ($i = 0; $i < 4; $i++) {
+            $dict['{{FEATURE_' . ($i + 1) . '_TITLE}}'] = $txt($copy['features'][$i]['title'] ?? "Beneficio " . ($i + 1) . " para {$kw}");
+            $dict['{{FEATURE_' . ($i + 1) . '_P}}']     = $html($copy['features'][$i]['p_html'] ?? '', "Mejora concreta en claridad y conversión para {$kw}.");
         }
 
-        // PACK
-        $set('626f6cb9', 'title',  $copy['pack_h2'] ?? '', 'pack_h2');
-        $set('54b57324', 'editor', $copy['pack_p_html'] ?? '', 'pack_p_html');
-
-        // KIT
-        $set('128f6ab7', 'title',  $copy['kit_h1'] ?? '', 'kit_h1');
-        $set('7a1fce8f', 'editor', $copy['kit_p_html'] ?? '', 'kit_p_html');
-
-        // FAQ title
-        $set('678996a8', 'title', $copy['faq_title'] ?? '', 'faq_title');
-
-        // FAQ questions (nested-accordion)
-        $mutateWidget('3e1245bf', function (&$w) use ($copy) {
-            if (!isset($w['settings']['items']) || !is_array($w['settings']['items'])) return;
-            foreach ($w['settings']['items'] as $i => &$it) {
-                if (!isset($copy['faq'][$i])) continue;
-                $it['item_title'] = $this->toStr($copy['faq'][$i]['q'] ?? '');
-            }
-        }, 'faq_questions');
-
-        // FAQ answers (9)
-        $faqAnswerIds = ['2d6e26cb','f1d8e30','69d3dae9','39747426','41410836','7dff883d','655cce8a','6eab5a20','1d8a79cb'];
-        foreach ($faqAnswerIds as $i => $ansId) {
-            $set($ansId, 'editor', $copy['faq'][$i]['a_html'] ?? '', "faq{$i}_a");
+        for ($i = 0; $i < 9; $i++) {
+            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = $txt($copy['faq'][$i]['q'] ?? "Pregunta " . ($i + 1) . " sobre {$kw}");
+            $dict['{{FAQ_' . ($i + 1) . '_A}}'] = $html($copy['faq'][$i]['a_html'] ?? '', "Lo adaptamos a tu caso y lo dejamos listo para publicar, sin huecos.");
         }
 
-        // CTA final
-        $set('22fa414a', 'title', $copy['final_cta_h3'] ?? '', 'final_cta_h3');
-
-        // HARD FAIL si algo no se pudo setear o quedó vacío
-        if (!empty($missing) || !empty($blank)) {
-            throw new \RuntimeException(
-                "Elementor incompleto. Missing: " . implode(' | ', $missing) .
-                " || Blank: " . implode(' | ', $blank)
-            );
-        }
-
-        return [$tpl, $setCount, $sample];
+        return $dict;
     }
 
-    private function collectWidgetIds(array $nodes): array
+    private function pick(array $arr): string
     {
-        $ids = [];
-
-        $walk = function($node) use (&$walk, &$ids) {
-            if (!is_array($node)) return;
-
-            if (($node['elType'] ?? null) === 'widget' && isset($node['id'])) {
-                $ids[] = (string)$node['id'];
-            }
-
-            if (isset($node['elements']) && is_array($node['elements'])) {
-                foreach ($node['elements'] as $child) {
-                    $walk($child);
-                }
-            }
-        };
-
-        foreach ($nodes as $n) $walk($n);
-
-        return array_values(array_unique($ids));
+        return $arr[random_int(0, count($arr) - 1)];
     }
 
     // ===========================================================
-    // Post-pass: reemplaza textos fijos que NO estén en los IDs
+    // Post-pass: reemplaza textos fijos (por si alguno quedó sin token)
     // ===========================================================
     private function forceReplaceStaticTextsInTemplate(array $tpl, array $copy): array
     {
@@ -1304,12 +1325,10 @@ PROMPT;
             "Opiniones" => $opinionesTitle,
             "Testimonios" => $testimoniosTitle,
             "Proyectos Web Realizados: Diseño, Desarrollo y Resultados que Hablan por Sí Solos" => $proyectosTitle,
-
             "Solicitar presupuesto" => $btnPresupuesto,
             "Agendar reunion" => $btnReunion,
             "Agendar reunion " => $btnReunion,
             "Agendar reunión" => $btnReunion,
-
             "¿Listo para avanzar con agencias de publicidad?" => $ctaFinal,
         ];
 
@@ -1321,7 +1340,7 @@ PROMPT;
             foreach ($nodes as &$n) {
                 if (!is_array($n)) continue;
 
-                if (($n['elType'] ?? null) === 'widget' && isset($n['settings']) && is_array($n['settings'])) {
+                if (isset($n['settings']) && is_array($n['settings'])) {
                     $this->replaceStringsRecursive($n['settings'], $mapExact, $count);
                 }
 
@@ -1364,351 +1383,4 @@ PROMPT;
             if ($v !== $orig) $count++;
         }
     }
-
-   
-
-    private function loadElementorTemplateForDomainWithPath(int $idDominio): array
-{
-    // 1) leer dominio
-    $dominio = \App\Models\DominiosModel::where('id_dominio', $idDominio)->first();
-    if (!$dominio) {
-        throw new \RuntimeException("Dominio no encontrado (id={$idDominio})");
-    }
-
-    // 2) path por dominio o fallback env
-    $templateRel = trim((string)($dominio->elementor_template_path ?? ''));
-    if ($templateRel === '') {
-        $templateRel = trim((string) env('ELEMENTOR_TEMPLATE_PATH', ''));
-    }
-
-    if ($templateRel === '') {
-        throw new \RuntimeException('No hay plantilla configurada (dominio ni env ELEMENTOR_TEMPLATE_PATH).');
-    }
-
-    // 3) normalizar como tu loader original
-    $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
-
-    if (preg_match('~^https?://~i', $templateRel)) {
-        $u = parse_url($templateRel);
-        $templateRel = $u['path'] ?? $templateRel;
-    }
-
-    $templateRel = preg_replace('~^/?storage/app/~i', '', $templateRel);
-    $templateRel = ltrim(str_replace('\\', '/', $templateRel), '/');
-
-    if (str_contains($templateRel, '..')) {
-        throw new \RuntimeException('Template path inválido (no se permite "..")');
-    }
-
-    $templatePath = storage_path('app/' . $templateRel);
-
-    if (!is_file($templatePath)) {
-        throw new \RuntimeException("No existe el template en disco: {$templatePath} (path={$templateRel})");
-    }
-
-    $raw = (string) file_get_contents($templatePath);
-    $tpl = json_decode($raw, true);
-
-    if (!is_array($tpl) || !isset($tpl['content']) || !is_array($tpl['content'])) {
-        throw new \RuntimeException('Template Elementor inválido: debe contener "content" (array).');
-    }
-
-    return [$tpl, $templatePath];
-}
-private function templateLooksLikeV64(array $tpl): bool
-{
-    // Si existen 2-3 IDs clave, asumimos que es v64
-    $need = ['abf38f1', '6963d8c', '22fa414a'];
-    $ids = $this->collectWidgetIds($tpl['content'] ?? []);
-    $set = array_flip($ids);
-
-    $hits = 0;
-    foreach ($need as $id) {
-        if (isset($set[$id])) $hits++;
-    }
-    return $hits >= 2;
-}
-
-private function fillElementorTemplate_byPlaceholders_withStats(array $tpl, array $copy): array
-{
-    $setCount = 0;
-
-    // Tokens que vas a poner en Elementor
-    $map = $this->buildPlaceholderMap($copy);
-
-    // Para sample/debug (no IDs, sino un sample de tokens)
-    $sample = array_slice(array_keys($map), 0, 18);
-
-    $walk = function (&$nodes) use (&$walk, $map, &$setCount) {
-        if (!is_array($nodes)) return;
-
-        foreach ($nodes as &$n) {
-            if (!is_array($n)) continue;
-
-            if (($n['elType'] ?? null) === 'widget' && isset($n['settings']) && is_array($n['settings'])) {
-                $this->replacePlaceholdersRecursive($n['settings'], $map, $setCount);
-            }
-
-            if (!empty($n['elements']) && is_array($n['elements'])) {
-                $walk($n['elements']);
-            }
-        }
-    };
-
-    if (isset($tpl['content']) && is_array($tpl['content'])) {
-        $walk($tpl['content']);
-    }
-
-    // Si no se reemplazó nada, probablemente el template no tiene tokens
-    if ($setCount < 5) {
-        throw new \RuntimeException(
-            "Template sin placeholders (o no detectados). Reemplazos={$setCount}. " .
-            "Asegúrate de usar tokens como {{HERO_H1}}, {{HERO_P}}, etc."
-        );
-    }
-
-    return [$tpl, $setCount, $sample];
-}
-
-private function buildPlaceholderMap(array $copy): array
-{
-    // Usa tu toStr() / ensureHtml() si ya los tienes
-    $kw = $this->shortKw();
-
-    $heroH1 = trim(strip_tags($this->toStr($copy['hero_h1'] ?? $kw)));
-    $heroP  = $this->toStr($copy['hero_p_html'] ?? '<p></p>');
-    $kitH1  = trim(strip_tags($this->toStr($copy['kit_h1'] ?? "Kit para {$kw}")));
-    $kitP   = $this->toStr($copy['kit_p_html'] ?? '<p></p>');
-    $packH2 = trim(strip_tags($this->toStr($copy['pack_h2'] ?? "Pack de {$kw}")));
-    $packP  = $this->toStr($copy['pack_p_html'] ?? '<p></p>');
-    $faqT   = trim(strip_tags($this->toStr($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}")));
-    $cta    = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?")));
-
-    $map = [
-        '{{HERO_H1}}' => $heroH1,
-        '{{HERO_P}}'  => $heroP,
-
-        '{{KIT_H1}}'  => $kitH1,
-        '{{KIT_P}}'   => $kitP,
-
-        '{{PACK_H2}}' => $packH2,
-        '{{PACK_P}}'  => $packP,
-
-        '{{FAQ_TITLE}}' => $faqT,
-        '{{FINAL_CTA}}' => $cta,
-
-        // Botones (pon estos tokens en botones)
-        '{{BTN_PRESUPUESTO}}' => $this->pick(['Solicitar presupuesto','Pedir presupuesto','Solicitar propuesta']),
-        '{{BTN_REUNION}}'     => $this->pick(['Agendar reunión','Reservar llamada','Agendar llamada']),
-    ];
-
-    // FEATURES 1..4
-    for ($i=0; $i<4; $i++) {
-        $t = trim(strip_tags($this->toStr($copy['features'][$i]['title'] ?? "Mejora {$i} para {$kw}")));
-        $p = $this->toStr($copy['features'][$i]['p_html'] ?? '<p></p>');
-        $map['{{FEATURE_'.($i+1).'_TITLE}}'] = $t;
-        $map['{{FEATURE_'.($i+1).'_P}}']     = $p;
-    }
-
-    // FAQ 1..9
-    for ($i=0; $i<9; $i++) {
-        $q = trim(strip_tags($this->toStr($copy['faq'][$i]['q'] ?? "Pregunta {$i} sobre {$kw}")));
-        $a = $this->toStr($copy['faq'][$i]['a_html'] ?? '<p></p>');
-        $map['{{FAQ_'.($i+1).'_Q}}'] = $q;
-        $map['{{FAQ_'.($i+1).'_A}}'] = $a;
-    }
-
-    return $map;
-}
-
-private function replacePlaceholdersRecursive(array &$arr, array $map, int &$setCount): void
-{
-    foreach ($arr as $k => &$v) {
-        if (is_array($v)) {
-            $this->replacePlaceholdersRecursive($v, $map, $setCount);
-            continue;
-        }
-
-        if (!is_string($v) || $v === '') continue;
-
-        $orig = $v;
-
-        foreach ($map as $token => $replacement) {
-            if (str_contains($v, $token)) {
-                $v = str_replace($token, (string)$replacement, $v);
-            }
-        }
-
-        if ($v !== $orig) $setCount++;
-    }
-}
-private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
-{
-    $dict = $this->buildPrettyTokenDictionary($copy);
-
-    $replacedCount = 0;
-
-    $walk = function (&$nodes) use (&$walk, $dict, &$replacedCount) {
-        if (!is_array($nodes)) return;
-
-        foreach ($nodes as &$n) {
-            if (!is_array($n)) continue;
-
-            // Reemplazar en settings de cualquier elemento (widget/section/column)
-            if (isset($n['settings']) && is_array($n['settings'])) {
-                $this->replacePrettyTokensRecursive($n['settings'], $dict, $replacedCount);
-            }
-
-            if (!empty($n['elements']) && is_array($n['elements'])) {
-                $walk($n['elements']);
-            }
-        }
-    };
-
-    if (isset($tpl['content']) && is_array($tpl['content'])) {
-        $walk($tpl['content']);
-    }
-
-    $remaining = $this->collectRemainingPrettyTokens($tpl);
-
-    return [$tpl, $replacedCount, $remaining];
-}
-
-private function replacePrettyTokensRecursive(array &$arr, array $dict, int &$count): void
-{
-    foreach ($arr as $k => &$v) {
-        if (is_array($v)) {
-            $this->replacePrettyTokensRecursive($v, $dict, $count);
-            continue;
-        }
-
-        if (!is_string($v) || $v === '') continue;
-        if (!str_contains($v, '{{')) continue;
-
-        $orig = $v;
-
-        foreach ($dict as $token => $rep) {
-            if (str_contains($v, $token)) {
-                $v = str_replace($token, $rep, $v);
-            }
-        }
-
-        if ($v !== $orig) $count++;
-    }
-}
-
-private function collectRemainingPrettyTokens(array $tpl): array
-{
-    $found = [];
-
-    $content = $tpl['content'] ?? [];
-    $walk = function ($nodes) use (&$walk, &$found) {
-        if (!is_array($nodes)) return;
-
-        foreach ($nodes as $n) {
-            if (!is_array($n)) continue;
-
-            if (isset($n['settings']) && is_array($n['settings'])) {
-                $this->scanStringsForTokens($n['settings'], $found);
-            }
-
-            if (!empty($n['elements']) && is_array($n['elements'])) {
-                $walk($n['elements']);
-            }
-        }
-    };
-
-    $walk($content);
-
-    $found = array_values(array_unique($found));
-    sort($found);
-    return $found;
-}
-
-private function scanStringsForTokens(array $arr, array &$found): void
-{
-    foreach ($arr as $v) {
-        if (is_array($v)) {
-            $this->scanStringsForTokens($v, $found);
-            continue;
-        }
-        if (!is_string($v) || $v === '') continue;
-
-        if (preg_match_all('/\{\{[A-Z0-9_]+\}\}/', $v, $m)) {
-            foreach ($m[0] as $tok) $found[] = $tok;
-        }
-    }
-}
-
-private function buildPrettyTokenDictionary(array $copy): array
-{
-    $kw = $this->shortKw();
-
-    // helpers
-    $txt = fn($v) => trim(strip_tags((string)$v));
-    $html = fn($v) => (string)$v;
-
-    $heroH1 = $txt($copy['hero_h1'] ?? $kw);
-    $heroP  = $html($copy['hero_p_html'] ?? "<p></p>");
-    $kitH1  = $txt($copy['kit_h1'] ?? "Kit para {$kw}");
-    $kitP   = $html($copy['kit_p_html'] ?? "<p></p>");
-    $packH2 = $txt($copy['pack_h2'] ?? "Pack de {$kw}");
-    $packP  = $html($copy['pack_p_html'] ?? "<p></p>");
-    $faqT   = $txt($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}");
-    $cta    = $txt($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?");
-
-    $dict = [
-        '{{HERO_KICKER}}' => $this->pick(["Sitio web corporativo","Diseño web profesional","Web para captar clientes"]),
-        '{{HERO_H1}}'     => $heroH1,
-        '{{HERO_P}}'      => $heroP,
-
-        '{{KIT_H1}}' => $kitH1,
-        '{{KIT_P}}'  => $kitP,
-
-        '{{PACK_H2}}' => $packH2,
-        '{{PACK_P}}'  => $packP,
-
-        '{{FAQ_TITLE}}' => $faqT,
-        '{{FINAL_CTA}}' => $cta,
-
-        // Secciones que antes te quedaban fijas
-        '{{CLIENTS_LABEL}}'    => $this->pick(["Clientes","Marcas","Empresas"]),
-        '{{CLIENTS_SUBTITLE}}' => $this->pick([
-            "Empresas en toda España y el mundo ya confían en nosotros",
-            "Negocios que buscan resultados ya trabajan con nosotros",
-            "Equipos que apuestan por rendimiento y claridad",
-        ]),
-        '{{REVIEWS_LABEL}}'     => $this->pick(["Opiniones","Reseñas","Valoraciones"]),
-        '{{TESTIMONIOS_TITLE}}' => $this->pick(["Testimonios","Lo que dicen de nosotros","Experiencias reales"]),
-        '{{PROJECTS_TITLE}}'    => $this->pick([
-            "Proyectos Web Realizados: Diseño, Desarrollo y Resultados",
-            "Casos de éxito: webs listas para convertir",
-            "Trabajos recientes: estructura, diseño y conversión",
-        ]),
-
-        // Botones
-        '{{BTN_PRESUPUESTO}}' => $this->pick(["Solicitar presupuesto","Pedir presupuesto","Solicitar propuesta"]),
-        '{{BTN_REUNION}}'     => $this->pick(["Agendar reunión","Reservar llamada","Agendar llamada"]),
-    ];
-
-    // FEATURES 1..4
-    for ($i=0; $i<4; $i++) {
-        $dict['{{FEATURE_'.($i+1).'_TITLE}}'] = $txt($copy['features'][$i]['title'] ?? "Beneficio ".($i+1)." para {$kw}");
-        $dict['{{FEATURE_'.($i+1).'_P}}']     = $html($copy['features'][$i]['p_html'] ?? "<p></p>");
-    }
-
-    // FAQ 1..9
-    for ($i=0; $i<9; $i++) {
-        $dict['{{FAQ_'.($i+1).'_Q}}'] = $txt($copy['faq'][$i]['q'] ?? "Pregunta ".($i+1)." sobre {$kw}");
-        $dict['{{FAQ_'.($i+1).'_A}}'] = $html($copy['faq'][$i]['a_html'] ?? "<p></p>");
-    }
-
-    return $dict;
-}
-
-private function pick(array $arr): string
-{
-    return $arr[random_int(0, count($arr) - 1)];
-}
-
 }
