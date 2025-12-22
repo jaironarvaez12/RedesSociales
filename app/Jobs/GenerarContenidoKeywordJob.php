@@ -2,22 +2,21 @@
 
 namespace App\Jobs;
 
-use App\Models\DominiosModel;
-use App\Models\Dominios_Contenido_DetallesModel;
 use Illuminate\Bus\Queueable;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
-use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\SerializesModels;
-use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
+use App\Models\Dominios_Contenido_DetallesModel;
 
 class GenerarContenidoKeywordJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public $timeout = 2400;
-    public $tries = 1; // OJO: si tu worker corre con --tries=3, reintentará igual.
+    public $tries = 1;
 
     public function __construct(
         public string $idDominio,
@@ -161,29 +160,19 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             }
 
             // =========================
-            // Cargar plantilla por dominio + REEMPLAZAR TOKENS BONITOS
+            // Elementor template + reemplazo por TOKENS (opción 1)
             // =========================
             [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
-            // 1) reemplazo por tokens {{...}}
             [$filled, $replacedCount, $remaining] = $this->fillElementorTemplate_byPrettyTokens_withStats($tpl, $final);
 
-            // Si aquí da 0-2, casi seguro NO estás usando *-pretty.json
-            if ($replacedCount < 5) {
-                throw new \RuntimeException("Template no parece tokenizado (replacedCount={$replacedCount}). Usa elementor-64-pretty.json / elementor-65-pretty.json. Template: {$tplPath}");
+            // Si esto da muy bajo, tu plantilla no tiene tokens o no coinciden
+            if ($replacedCount < 10) {
+                throw new \RuntimeException("Template no parece tokenizado (replacedCount={$replacedCount}). Archivo: {$tplPath}");
             }
 
-            // Si quedaron tokens, NO publiques contenido con huecos
-            if (!empty($remaining)) {
-                throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 30)) . " (template={$tplPath})");
-            }
-
-            // 2) post-pass extra por si hay textos fijos no tokenizados
-            [$filled, $staticCount] = $this->forceReplaceStaticTextsInTemplate($filled, $final);
-
-            $totalReplacements = $replacedCount + $staticCount;
-            if ($totalReplacements < 8) {
-                throw new \RuntimeException("Pocos reemplazos totales (total={$totalReplacements}, pretty={$replacedCount}, static={$staticCount}). Template: {$tplPath}");
+            if (count($remaining) > 0) {
+                throw new \RuntimeException("Quedaron tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 40)));
             }
 
             // =========================
@@ -214,6 +203,55 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             ]);
             throw $e;
         }
+    }
+
+    // ===========================================================
+    // TEMPLATE LOADER (por dominio)
+    // ===========================================================
+    private function loadElementorTemplateForDomainWithPath(int $idDominio): array
+    {
+        $dominio = \App\Models\DominiosModel::where('id_dominio', $idDominio)->first();
+        if (!$dominio) {
+            throw new \RuntimeException("Dominio no encontrado (id={$idDominio})");
+        }
+
+        $templateRel = trim((string)($dominio->elementor_template_path ?? ''));
+        if ($templateRel === '') {
+            $templateRel = trim((string) env('ELEMENTOR_TEMPLATE_PATH', ''));
+        }
+
+        if ($templateRel === '') {
+            throw new \RuntimeException('No hay plantilla configurada (dominio ni env ELEMENTOR_TEMPLATE_PATH).');
+        }
+
+        $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
+
+        if (preg_match('~^https?://~i', $templateRel)) {
+            $u = parse_url($templateRel);
+            $templateRel = $u['path'] ?? $templateRel;
+        }
+
+        $templateRel = preg_replace('~^/?storage/app/~i', '', $templateRel);
+        $templateRel = ltrim(str_replace('\\', '/', $templateRel), '/');
+
+        if (str_contains($templateRel, '..')) {
+            throw new \RuntimeException('Template path inválido (no se permite "..")');
+        }
+
+        $templatePath = storage_path('app/' . $templateRel);
+
+        if (!is_file($templatePath)) {
+            throw new \RuntimeException("No existe el template en disco: {$templatePath} (path={$templateRel})");
+        }
+
+        $raw = (string) file_get_contents($templatePath);
+        $tpl = json_decode($raw, true);
+
+        if (!is_array($tpl) || !isset($tpl['content']) || !is_array($tpl['content'])) {
+            throw new \RuntimeException('Template Elementor inválido: debe contener "content" (array).');
+        }
+
+        return [$tpl, $templatePath];
     }
 
     // ===========================================================
@@ -795,23 +833,6 @@ PROMPT;
         $copy['features'] = $this->normalizeFeatures($copy['features'], 4);
         $copy['faq']      = $this->normalizeFaq($copy['faq'], 9);
 
-        // Fix final por si llega algo tipo "<p><br></p>"
-        foreach ($copy['features'] as $i => $f) {
-            $t = trim(strip_tags($this->toStr($f['title'] ?? '')));
-            $p = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($f['p_html'] ?? '')));
-            if ($t === '') $t = "Mejora clave para {$kw}";
-            if ($this->isBlankHtml($p)) $p = "<p><strong>Qué aporta:</strong> mejora concreta en claridad y conversión para {$kw}, sin relleno.</p>";
-            $copy['features'][$i] = ['title' => $t, 'p_html' => $p];
-        }
-
-        foreach ($copy['faq'] as $i => $q) {
-            $qq = trim(strip_tags($this->toStr($q['q'] ?? '')));
-            $aa = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($q['a_html'] ?? '')));
-            if ($qq === '') $qq = "¿Cómo funciona {$kw}?";
-            if ($this->isBlankHtml($aa)) $aa = "<p>Lo adaptamos a tu caso y lo dejamos listo para publicar, sin huecos.</p>";
-            $copy['faq'][$i] = ['q' => $qq, 'a_html' => $aa];
-        }
-
         if ($this->violatesSeoHardRules($copy)) {
             throw new \RuntimeException("El JSON viola reglas SEO/H1");
         }
@@ -1051,60 +1072,12 @@ PROMPT;
     }
 
     // ===========================================================
-    // TEMPLATE LOADER por dominio
-    // ===========================================================
-    private function loadElementorTemplateForDomainWithPath(int $idDominio): array
-    {
-        $dominio = DominiosModel::where('id_dominio', $idDominio)->first();
-        if (!$dominio) {
-            throw new \RuntimeException("Dominio no encontrado (id={$idDominio})");
-        }
-
-        $templateRel = trim((string)($dominio->elementor_template_path ?? ''));
-        if ($templateRel === '') {
-            $templateRel = trim((string) env('ELEMENTOR_TEMPLATE_PATH', ''));
-        }
-
-        if ($templateRel === '') {
-            throw new \RuntimeException('No hay plantilla configurada (dominio ni env ELEMENTOR_TEMPLATE_PATH).');
-        }
-
-        $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
-
-        if (preg_match('~^https?://~i', $templateRel)) {
-            $u = parse_url($templateRel);
-            $templateRel = $u['path'] ?? $templateRel;
-        }
-
-        $templateRel = preg_replace('~^/?storage/app/~i', '', $templateRel);
-        $templateRel = ltrim(str_replace('\\', '/', $templateRel), '/');
-
-        if (str_contains($templateRel, '..')) {
-            throw new \RuntimeException('Template path inválido (no se permite "..")');
-        }
-
-        $templatePath = storage_path('app/' . $templateRel);
-
-        if (!is_file($templatePath)) {
-            throw new \RuntimeException("No existe el template en disco: {$templatePath} (path={$templateRel})");
-        }
-
-        $raw = (string) file_get_contents($templatePath);
-        $tpl = json_decode($raw, true);
-
-        if (!is_array($tpl) || !isset($tpl['content']) || !is_array($tpl['content'])) {
-            throw new \RuntimeException('Template Elementor inválido: debe contener "content" (array).');
-        }
-
-        return [$tpl, $templatePath];
-    }
-
-    // ===========================================================
-    // Opción 1: reemplazo por tokens bonitos {{...}}
+    // Relleno Elementor por TOKENS + stats
     // ===========================================================
     private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
     {
         $dict = $this->buildPrettyTokenDictionary($copy);
+
         $replacedCount = 0;
 
         $walk = function (&$nodes) use (&$walk, $dict, &$replacedCount) {
@@ -1123,9 +1096,12 @@ PROMPT;
             }
         };
 
-        $walk($tpl['content']);
+        if (isset($tpl['content']) && is_array($tpl['content'])) {
+            $walk($tpl['content']);
+        }
 
         $remaining = $this->collectRemainingPrettyTokens($tpl);
+
         return [$tpl, $replacedCount, $remaining];
     }
 
@@ -1156,6 +1132,7 @@ PROMPT;
     {
         $found = [];
 
+        $content = $tpl['content'] ?? [];
         $walk = function ($nodes) use (&$walk, &$found) {
             if (!is_array($nodes)) return;
 
@@ -1172,7 +1149,7 @@ PROMPT;
             }
         };
 
-        $walk($tpl['content'] ?? []);
+        $walk($content);
 
         $found = array_values(array_unique($found));
         sort($found);
@@ -1198,22 +1175,28 @@ PROMPT;
     {
         $kw = $this->shortKw();
 
-        $txt  = fn($v) => trim(strip_tags($this->toStr($v)));
-        $html = fn($v, $fb) => $this->ensureHtml($v, $fb);
+        $heroH1 = trim(strip_tags($this->toStr($copy['hero_h1'] ?? $kw)));
+        $heroP  = $this->toStr($copy['hero_p_html'] ?? "<p></p>");
+        $kitH1  = trim(strip_tags($this->toStr($copy['kit_h1'] ?? "Kit para {$kw}")));
+        $kitP   = $this->toStr($copy['kit_p_html'] ?? "<p></p>");
+        $packH2 = trim(strip_tags($this->toStr($copy['pack_h2'] ?? "Pack de {$kw}")));
+        $packP  = $this->toStr($copy['pack_p_html'] ?? "<p></p>");
+        $faqT   = trim(strip_tags($this->toStr($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}")));
+        $cta    = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?")));
 
-        $heroH1 = $txt($copy['hero_h1'] ?? $kw);
-        $heroP  = $html($copy['hero_p_html'] ?? '', "Una solución clara para {$kw} enfocada en conversión.");
-        $kitH1  = $txt($copy['kit_h1'] ?? "Kit para {$kw}");
-        $kitP   = $html($copy['kit_p_html'] ?? '', "Contenido pensado para implementar rápido en {$kw}.");
-        $packH2 = $txt($copy['pack_h2'] ?? "Pack de {$kw}");
-        $packP  = $html($copy['pack_p_html'] ?? '', "Estructura y copy listos, sin huecos ni secciones vacías.");
-        $faqT   = $txt($copy['faq_title'] ?? "Preguntas frecuentes sobre {$kw}");
-        $cta    = $txt($copy['final_cta_h3'] ?? "¿Listo para avanzar con {$kw}?");
+        // Kit Digital (tokens nuevos)
+        $kitDigitalBold = $this->pick(["Kit Digital", "Bono Digital", "Ayuda Digital"]);
+        $kitDigitalP = $this->pick([
+            "<p><strong>Crea tu web sin coste</strong> con el bono. Te guiamos con la solicitud y dejamos tu sitio listo para captar clientes.</p><p><strong>Autónomos y Pymes</strong> ➝ diseño web, eCommerce y SEO (según convocatoria).</p>",
+            "<p>Consigue tu web con el <strong>Kit Digital</strong>. Te ayudamos a tramitar la ayuda y a lanzar tu proyecto online con enfoque a conversión.</p><p><strong>Autónomos y Pymes</strong> ➝ web corporativa, tienda online y SEO.</p>",
+            "<p>Si cumples requisitos, puedes tener tu web con el <strong>Kit Digital</strong>. Nosotros nos encargamos del proceso y de la ejecución.</p><p><strong>Autónomos y Pymes</strong> ➝ diseño web y SEO.</p>",
+        ]);
+
+        $featuresListHtml = $this->buildFeaturesListHtml($copy);
 
         $dict = [
-            '{{HERO_KICKER}}' => $this->pick(["Sitio web corporativo","Diseño web profesional","Web para captar clientes"]),
-            '{{HERO_H1}}'     => $heroH1,
-            '{{HERO_P}}'      => $heroP,
+            '{{HERO_H1}}' => $heroH1,
+            '{{HERO_P}}'  => $heroP,
 
             '{{KIT_H1}}' => $kitH1,
             '{{KIT_P}}'  => $kitP,
@@ -1224,163 +1207,59 @@ PROMPT;
             '{{FAQ_TITLE}}' => $faqT,
             '{{FINAL_CTA}}' => $cta,
 
-            '{{CLIENTS_LABEL}}'    => $this->pick(["Clientes","Marcas","Empresas","Negocios"]),
-            '{{CLIENTS_SUBTITLE}}' => $this->pick([
-                "Empresas en toda España y el mundo ya confían en nosotros",
-                "Negocios que buscan resultados ya trabajan con nosotros",
-                "Equipos que apuestan por rendimiento y claridad",
-            ]),
-            '{{REVIEWS_LABEL}}'     => $this->pick(["Opiniones","Reseñas","Valoraciones"]),
-            '{{TESTIMONIOS_TITLE}}' => $this->pick(["Testimonios","Lo que dicen de nosotros","Experiencias reales"]),
-            '{{PROJECTS_TITLE}}'    => $this->pick([
-                "Proyectos Web Realizados: Diseño, Desarrollo y Resultados",
-                "Casos de éxito: webs listas para convertir",
-                "Trabajos recientes: estructura, diseño y conversión",
-            ]),
-
+            // Botones generales
             '{{BTN_PRESUPUESTO}}' => $this->pick(["Solicitar presupuesto","Pedir presupuesto","Solicitar propuesta"]),
             '{{BTN_REUNION}}'     => $this->pick(["Agendar reunión","Reservar llamada","Agendar llamada"]),
+
+            // NUEVOS: Kit Digital
+            '{{KITDIGITAL_BOLD}}' => $kitDigitalBold,
+            '{{KITDIGITAL_P}}'    => $kitDigitalP,
+            '{{BTN_KITDIGITAL}}'  => $this->pick(["Acceder al Kit Digital","Ver Kit Digital","Solicitar Kit Digital"]),
+
+            // NUEVOS: reemplaza el bloque de 4 Lorem ipsum
+            '{{FEATURES_LIST_HTML}}' => $featuresListHtml,
         ];
 
-        for ($i = 0; $i < 4; $i++) {
-            $dict['{{FEATURE_' . ($i + 1) . '_TITLE}}'] = $txt($copy['features'][$i]['title'] ?? "Beneficio " . ($i + 1) . " para {$kw}");
-            $dict['{{FEATURE_' . ($i + 1) . '_P}}']     = $html($copy['features'][$i]['p_html'] ?? '', "Mejora concreta en claridad y conversión para {$kw}.");
+        // FEATURES 1..4
+        for ($i=0; $i<4; $i++) {
+            $dict['{{FEATURE_'.($i+1).'_TITLE}}'] = trim(strip_tags($this->toStr($copy['features'][$i]['title'] ?? "Beneficio ".($i+1)." para {$kw}")));
+            $dict['{{FEATURE_'.($i+1).'_P}}']     = $this->toStr($copy['features'][$i]['p_html'] ?? "<p></p>");
         }
 
-        for ($i = 0; $i < 9; $i++) {
-            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = $txt($copy['faq'][$i]['q'] ?? "Pregunta " . ($i + 1) . " sobre {$kw}");
-            $dict['{{FAQ_' . ($i + 1) . '_A}}'] = $html($copy['faq'][$i]['a_html'] ?? '', "Lo adaptamos a tu caso y lo dejamos listo para publicar, sin huecos.");
+        // FAQ 1..9
+        for ($i=0; $i<9; $i++) {
+            $dict['{{FAQ_'.($i+1).'_Q}}'] = trim(strip_tags($this->toStr($copy['faq'][$i]['q'] ?? "Pregunta ".($i+1)." sobre {$kw}")));
+            $dict['{{FAQ_'.($i+1).'_A}}'] = $this->toStr($copy['faq'][$i]['a_html'] ?? "<p></p>");
         }
 
         return $dict;
     }
 
+    private function buildFeaturesListHtml(array $copy): string
+    {
+        $kw = $this->shortKw();
+        $features = isset($copy['features']) && is_array($copy['features']) ? $copy['features'] : [];
+
+        $parts = [];
+        for ($i=0; $i<4; $i++) {
+            $t = trim(strip_tags($this->toStr($features[$i]['title'] ?? "Mejora ".($i+1)." para {$kw}")));
+            $pRaw = $this->toStr($features[$i]['p_html'] ?? '');
+            $pTxt = trim(preg_replace('~\s+~u', ' ', strip_tags($pRaw)));
+
+            if ($t === '') $t = "Mejora ".($i+1)." para {$kw}";
+            if ($pTxt === '') $pTxt = "Mejora concreta para claridad y conversión, adaptada a {$kw}.";
+
+            $safeT = htmlspecialchars($t, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safeP = htmlspecialchars($pTxt, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+            $parts[] = "<p><strong>{$safeT}:</strong> {$safeP}</p>";
+        }
+
+        return implode('', $parts);
+    }
+
     private function pick(array $arr): string
     {
         return $arr[random_int(0, count($arr) - 1)];
-    }
-
-    // ===========================================================
-    // Post-pass: reemplaza textos fijos (por si alguno quedó sin token)
-    // ===========================================================
-    private function forceReplaceStaticTextsInTemplate(array $tpl, array $copy): array
-    {
-        $kw = $this->shortKw();
-
-        $btnPresupuesto = $this->pick([
-            'Solicitar presupuesto',
-            'Pedir presupuesto',
-            'Solicitar propuesta',
-            'Pedir propuesta',
-            'Quiero presupuesto',
-        ]);
-
-        $btnReunion = $this->pick([
-            'Agendar reunión',
-            'Agendar reunion',
-            'Reservar reunión',
-            'Reservar llamada',
-            'Agendar llamada',
-            'Hablar con un experto',
-        ]);
-
-        $headlineHero = $this->pick([
-            "Más que una web: una herramienta para captar clientes",
-            "Tu web como motor de clientes (no solo diseño)",
-            "Una web pensada para convertir visitas en contactos",
-            "Web enfocada en resultados, velocidad y conversión",
-        ]);
-
-        $clientesSub = $this->pick([
-            "Empresas en España y fuera ya confían en nosotros",
-            "Marcas de distintos sectores ya trabajan con nosotros",
-            "Negocios que buscan resultados ya han confiado en este servicio",
-            "Equipos en crecimiento ya apuestan por una web orientada a conversión",
-        ]);
-
-        $opinionesTitle = $this->pick(['Opiniones', 'Reseñas', 'Valoraciones']);
-        $testimoniosTitle = $this->pick(['Testimonios', 'Lo que dicen nuestros clientes', 'Experiencias de clientes']);
-
-        $proyectosTitle = $this->pick([
-            "Proyectos web: diseño, desarrollo y resultados",
-            "Trabajos realizados: estructura, rendimiento y conversión",
-            "Casos de web: lo que se construye y lo que se consigue",
-            "Proyectos web publicados: enfoque y ejecución",
-        ]);
-
-        $ctaFinal = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? '')));
-        if ($ctaFinal === '') $ctaFinal = "¿Listo para avanzar con {$kw}?";
-
-        $mapExact = [
-            "Sitio web corporativo" => $this->pick([
-                "Web corporativa profesional",
-                "Sitio corporativo optimizado",
-                "Web corporativa enfocada en conversión",
-                "Página corporativa de alto rendimiento",
-            ]),
-            "Más Que Una Web, Una Herramienta Para Captar Nuevos Clientes" => $headlineHero,
-            "Más que una web, una herramienta para captar nuevos clientes" => $headlineHero,
-            "Clientes" => $this->pick(["Clientes", "Marcas", "Empresas", "Negocios"]),
-            "Empresas en toda España y el mundo ya confían en nosotros" => $clientesSub,
-            "Opiniones" => $opinionesTitle,
-            "Testimonios" => $testimoniosTitle,
-            "Proyectos Web Realizados: Diseño, Desarrollo y Resultados que Hablan por Sí Solos" => $proyectosTitle,
-            "Solicitar presupuesto" => $btnPresupuesto,
-            "Agendar reunion" => $btnReunion,
-            "Agendar reunion " => $btnReunion,
-            "Agendar reunión" => $btnReunion,
-            "¿Listo para avanzar con agencias de publicidad?" => $ctaFinal,
-        ];
-
-        $count = 0;
-
-        $walk = function (&$nodes) use (&$walk, $mapExact, &$count) {
-            if (!is_array($nodes)) return;
-
-            foreach ($nodes as &$n) {
-                if (!is_array($n)) continue;
-
-                if (isset($n['settings']) && is_array($n['settings'])) {
-                    $this->replaceStringsRecursive($n['settings'], $mapExact, $count);
-                }
-
-                if (!empty($n['elements']) && is_array($n['elements'])) {
-                    $walk($n['elements']);
-                }
-            }
-        };
-
-        if (isset($tpl['content']) && is_array($tpl['content'])) {
-            $walk($tpl['content']);
-        }
-
-        return [$tpl, $count];
-    }
-
-    private function replaceStringsRecursive(array &$arr, array $mapExact, int &$count): void
-    {
-        foreach ($arr as $k => &$v) {
-            if (is_array($v)) {
-                $this->replaceStringsRecursive($v, $mapExact, $count);
-                continue;
-            }
-            if (!is_string($v)) continue;
-
-            $orig = $v;
-
-            $trim = trim($v);
-            if (isset($mapExact[$trim])) {
-                $v = $mapExact[$trim];
-            } else {
-                foreach ($mapExact as $from => $to) {
-                    if ($from === '') continue;
-                    if (str_contains($v, $from)) {
-                        $v = str_replace($from, $to, $v);
-                    }
-                }
-            }
-
-            if ($v !== $orig) $count++;
-        }
     }
 }
