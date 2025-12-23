@@ -9,23 +9,41 @@ class Dominios_Contenido_DetallesModel extends Model
 {
     use HasFactory;
 
-      protected $table = 'dominios_contenido_detalles';
+    protected $table = 'dominios_contenido_detalles';
+
     protected $primaryKey = 'id_dominio_contenido_detalle';
 
-    public $timestamps = true;
+    public $incrementing = true;     // ✅ autoincrement
+    protected $keyType = 'int';      // ✅
+protected $casts = ['scheduled_at' => 'datetime'];
 
     protected $fillable = [
-        'job_uuid',
         'id_dominio_contenido',
         'id_dominio',
+
         'tipo',
         'keyword',
-        'estatus',
-        'modelo',
+        'enfoque',
+
         'title',
         'slug',
-        'draft_html',
         'contenido_html',
+
+        'meta_title',
+        'meta_description',
+
+        'wp_post_id',
+        'wp_url',
+
+        'estatus',
         'error',
+
+        'draft_html',
+        'modelo',
+        'wp_id',
+        'wp_link',
+        'job_uuid'
+      
+        
     ];
 }
