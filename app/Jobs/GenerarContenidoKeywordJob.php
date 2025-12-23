@@ -89,7 +89,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             // (c) Crear si no existía nada reusable
             if (!$registro) {
                 $registro = Dominios_Contenido_DetallesModel::create([
-                    'job_uuid' => $this->jobUuid, // ✅ 36 chars
+                    'job_uuid' => (string) \Illuminate\Support\Str::uuid(),
                     'id_dominio_contenido' => (int)$this->idDominioContenido,
                     'id_dominio' => (int)$this->idDominio,
                     'tipo' => $this->tipo,
