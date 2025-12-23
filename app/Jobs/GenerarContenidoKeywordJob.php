@@ -22,7 +22,8 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     public $tries   = 5;
     public $backoff = [60, 120, 300, 600, 900];
 
-    public ?int $registroId = null;
+    // ✅ Identificador estable del Job (idempotencia real)
+    public string $jobUuid;
 
     private array $briefContext = [];
 
@@ -31,32 +32,37 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         public string $idDominioContenido,
         public string $tipo,
         public string $keyword
-    ) {}
+    ) {
+        // ✅ Se serializa en el payload del Job y sobrevive reintentos / reentregas
+        $this->jobUuid = (string) Str::uuid();
+    }
 
     public function handle(): void
     {
-        // Reusar registro entre reintentos (para no crear basura en BD)
-        $registro = null;
-        if ($this->registroId) {
-            $registro = Dominios_Contenido_DetallesModel::where('id_dominio_contenido_detalle', $this->registroId)->first();
-        }
-
-        if (!$registro) {
-            $registro = Dominios_Contenido_DetallesModel::create([
+        // ✅ Idempotencia: si el job se corre 2 veces, cae en el MISMO registro
+        $registro = Dominios_Contenido_DetallesModel::firstOrCreate(
+            ['job_uuid' => $this->jobUuid],
+            [
                 'id_dominio_contenido' => (int)$this->idDominioContenido,
                 'id_dominio' => (int)$this->idDominio,
                 'tipo' => $this->tipo,
                 'keyword' => $this->keyword,
                 'estatus' => 'en_proceso',
                 'modelo' => env('DEEPSEEK_MODEL', 'deepseek-chat'),
-            ]);
-            $this->registroId = (int)$registro->id_dominio_contenido_detalle;
-        } else {
-            $registro->update([
-                'estatus' => 'en_proceso',
-                'modelo' => env('DEEPSEEK_MODEL', 'deepseek-chat'),
-            ]);
+                'job_uuid' => $this->jobUuid,
+            ]
+        );
+
+        // ✅ Si ya está generado, un segundo run no vuelve a generar (ahorra DeepSeek)
+        if ($registro->estatus === 'generado' && !empty($registro->contenido_html)) {
+            return;
         }
+
+        // Marcar en proceso (sirve para reintentos también)
+        $registro->update([
+            'estatus' => 'en_proceso',
+            'modelo' => env('DEEPSEEK_MODEL', 'deepseek-chat'),
+        ]);
 
         try {
             $apiKey = (string) env('DEEPSEEK_API_KEY', '');
@@ -1101,7 +1107,7 @@ PROMPT;
             '{{KIT_H1}}' => trim(strip_tags($this->toStr($copy['kit_h1']))),
             '{{KIT_P}}'  => $this->keepAllowedInlineHtml($this->toStr($copy['kit_p_html'])),
 
-            // FEATURES (incluye FEATURE_3_TITLE y FEATURE_3_P ✅)
+            // FEATURES
             '{{FEATURE_1_TITLE}}' => trim(strip_tags($this->toStr($copy['features'][0]['title']))),
             '{{FEATURE_1_P}}'     => $this->keepAllowedInlineHtml($this->toStr($copy['features'][0]['p_html'])),
 
@@ -1116,7 +1122,7 @@ PROMPT;
 
             '{{FEATURES_LIST_HTML}}' => $featuresListHtml,
 
-            // CLIENTS ✅ (subtitle corto + párrafo propio)
+            // CLIENTS
             '{{CLIENTS_LABEL}}'     => trim(strip_tags($this->toStr($copy['clients_label']))),
             '{{CLIENTS_SUBTITLE}}'  => trim(strip_tags($this->toStr($copy['clients_subtitle']))),
             '{{CLIENTS_P}}'         => $this->keepAllowedInlineHtml($this->toStr($copy['clients_p_html'])),
@@ -1136,16 +1142,16 @@ PROMPT;
             '{{BTN_PRESUPUESTO}}' => trim(strip_tags($this->toStr($copy['btn_presupuesto']))),
             '{{BTN_REUNION}}'     => trim(strip_tags($this->toStr($copy['btn_reunion']))),
 
-            // Kit Digital ✅
+            // Kit Digital
             '{{KITDIGITAL_BOLD}}' => trim(strip_tags($this->toStr($copy['kitdigital_bold']))),
             '{{KITDIGITAL_P}}'    => $this->keepAllowedInlineHtml($this->toStr($copy['kitdigital_p_html'])),
+
             '{{BTN_KITDIGITAL}}'  => trim(strip_tags($this->toStr($copy['btn_kitdigital']))),
         ];
 
         // FAQ 1..9
         for ($i = 0; $i < 9; $i++) {
             $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = trim(strip_tags($this->toStr($copy['faq'][$i]['q'])));
-
             $dict['{{FAQ_' . ($i + 1) . '_A}}'] = $this->keepAllowedInlineHtml($this->toStr($copy['faq'][$i]['a_html']));
         }
 
@@ -1345,7 +1351,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // Anti-repetición (igual que tu versión)
+    // Anti-repetición
     // ===========================================================
     private function isTooSimilarToAnyPrevious(array $copy, array $usedTitles, array $usedCorpus): bool
     {

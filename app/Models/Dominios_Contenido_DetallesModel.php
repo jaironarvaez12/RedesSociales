@@ -42,6 +42,7 @@ protected $casts = ['scheduled_at' => 'datetime'];
         'modelo',
         'wp_id',
         'wp_link',
+        'job_uuid'
       
         
     ];
