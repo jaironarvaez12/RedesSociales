@@ -33,8 +33,8 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     ) {
         /**
          * ✅ CAMBIO CLAVE:
-         * Antes: job_uuid determinístico (md5(input)) => reusabas registros viejos si repetías keyword/tipo.
-         * Ahora: UUID real aleatorio por dispatch (pero estable durante reintentos).
+         * - Antes el job_uuid era determinístico (md5 del input) y por eso “reusabas” registros viejos.
+         * - Ahora es UUID real por dispatch. En reintentos del mismo job se mantiene.
          */
         $this->jobUuid = (string) Str::uuid();
     }
@@ -95,7 +95,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             // ===========================================================
             [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
-            $tokenMeta = $this->extractTokensAndContexts($tpl); // [ tokenKey => ['is_html'=>bool] ]
+            $tokenMeta = $this->extractTokensAndContexts($tpl); // tokenKey => ['is_html'=>bool]
             $tokenKeys = array_keys($tokenMeta);
 
             if (count($tokenKeys) < 1) {
@@ -140,16 +140,15 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             ]);
 
             if ($replacedCount < 1) {
-                // Antes te explotaba aquí: era por mismatch de nombres de tokens entre plantilla y diccionario.
                 throw new \RuntimeException("NO_RETRY: No se reemplazó ningún token. Template: {$tplPath}");
             }
 
             if (!empty($remaining)) {
-                throw new \RuntimeException("NO_RETRY: Tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 80)));
+                throw new \RuntimeException("NO_RETRY: Tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 120)));
             }
 
             // ===========================================================
-            // 7) Title + slug (si existe algún token tipo HERO/SEO)
+            // 7) Title + slug
             // ===========================================================
             $titleCandidate = $values['SEO_TITLE']
                 ?? $values['seo_title']
@@ -164,7 +163,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $slug = $slugBase . '-' . $registro->id_dominio_contenido_detalle;
 
             // ===========================================================
-            // 8) Guardar (draft_html = values, contenido_html = tpl final)
+            // 8) Guardar
             // ===========================================================
             $registro->update([
                 'title'          => $title,
@@ -273,9 +272,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 $key = (string)$tokenKey;
 
                 // Heurística: si el campo donde aparece suele renderizar HTML, lo marcamos.
-                $isHtml = in_array($parentKey, [
-                    'editor', 'html', 'content', 'description', 'p_html', 'a_html'
-                ], true);
+                $isHtml = in_array($parentKey, ['editor', 'html', 'content', 'description', 'p_html', 'a_html'], true);
 
                 // Botones en Elementor suelen usar "text" pero eso NO es HTML
                 if ($parentKey === 'text') $isHtml = false;
@@ -283,7 +280,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 if (!isset($meta[$key])) {
                     $meta[$key] = ['is_html' => $isHtml];
                 } else {
-                    // Si aparece en algún campo HTML, lo tratamos como HTML
                     $meta[$key]['is_html'] = $meta[$key]['is_html'] || $isHtml;
                 }
             }
@@ -297,6 +293,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
     // ===========================================================
     // Generación dinámica: pide a DeepSeek EXACTO lo que la plantilla usa
+    // + Parser robusto: acepta JSON plano o agrupado y elimina keys inválidas
     // ===========================================================
     private function generateValuesForTemplateTokens(
         string $apiKey,
@@ -320,7 +317,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             else $plainKeys[] = $k;
         }
 
-        // Reducimos ruido: no mandamos 5000 chars de historial
         $noRepetirTitles = mb_substr($noRepetirTitles, 0, 800);
         $noRepetirCorpus = mb_substr($noRepetirCorpus, 0, 1200);
 
@@ -328,17 +324,18 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         $htmlList  = implode(', ', $htmlKeys);
 
         $prompt = <<<PROMPT
-Devuelve SOLO JSON válido. Sin markdown. RESPUESTA MINIFICADA.
+Devuelve SOLO JSON válido. Sin markdown. Sin comentarios.
+⚠️ OBLIGATORIO: JSON PLANO (un solo objeto). NO uses "PLAIN_KEYS" ni "HTML_KEYS".
+⚠️ PROHIBIDO: keys vacías, keys nuevas o keys que no estén en la lista.
 
-Vas a generar valores PARA REEMPLAZAR tokens de una plantilla Elementor.
 Keyword: {$keyword}
 Tipo: {$tipo}
 
 BRIEF:
-- Ángulo: {$angle}
-- Tono: {$tone}
-- Público: {$aud}
-- CTA: {$cta}
+Ángulo: {$angle}
+Tono: {$tone}
+Público: {$aud}
+CTA: {$cta}
 
 NO repetir títulos:
 {$noRepetirTitles}
@@ -346,24 +343,24 @@ NO repetir títulos:
 NO repetir textos/ideas:
 {$noRepetirCorpus}
 
-REGLAS DURAS:
-- No dejar campos vacíos.
+Reglas:
+- No dejar valores vacíos.
 - No keyword stuffing (no repitas "{$keyword}" en todos los títulos).
-- Texto en español.
-- Para keys HTML: usar SOLO <p>, <strong>, <br> y siempre envolver en <p>...</p>.
+- Español.
+- Keys HTML: SOLO <p>, <strong>, <br> y SIEMPRE envolver en <p>...</p>.
 
-DEVUELVE un JSON cuyas KEYS sean EXACTAMENTE estas (sin llaves):
+DEVUELVE SOLO estas keys (y nada más):
 PLAIN_KEYS: {$plainList}
 HTML_KEYS: {$htmlList}
 
-Ejemplo de forma (no copies contenido):
-{"HERO_H1":"...","BTN_PRESUPUESTO":"...","SECTION_1_TITLE":"...","P_01":"<p>...</p>"}
+Ejemplo de FORMA (no copies contenido):
+{"HERO_H1":"...","BTN_PRESUPUESTO":"...","P_01":"<p>...</p>"}
 PROMPT;
 
         $raw = $this->deepseekText($apiKey, $model, $prompt, maxTokens: 3600, temperature: 0.85, topP: 0.9, jsonMode: true);
-        $arr = $this->parseJsonStrict($raw);
+        $arr = $this->parseJsonStrict($raw); // ✅ robusto
 
-        // Normalizar + fallbacks por si DeepSeek deja algo vacío
+        // Normalizar + fallbacks si queda vacío
         $out = [];
         foreach ($tokenMeta as $k => $m) {
             $val = $arr[$k] ?? '';
@@ -383,6 +380,11 @@ PROMPT;
             $out[$k] = $val;
         }
 
+        // Fallback extra: HERO_H1 nunca puede quedar vacío si existe
+        if (isset($out['HERO_H1']) && trim($out['HERO_H1']) === '') {
+            $out['HERO_H1'] = $this->fallbackTextFor('HERO_H1', $keyword);
+        }
+
         return $out;
     }
 
@@ -390,7 +392,6 @@ PROMPT;
     {
         $kw = trim($keyword) !== '' ? trim($keyword) : 'tu servicio';
 
-        // Secciones: dar títulos “reales” en vez de "Sección 1"
         if (preg_match('/^SECTION_(\d+)_TITLE$/', $tokenKey, $mm)) {
             $i = (int)$mm[1];
             $topics = [
@@ -425,14 +426,16 @@ PROMPT;
             return "{$base} para {$kw}";
         }
 
-        // Botones
-        if (str_starts_with($tokenKey, 'BTN_') || $tokenKey === 'BTN_PRESUPUESTO' || $tokenKey === 'BTN_REUNION') {
+        if (str_starts_with($tokenKey, 'BTN_') || in_array($tokenKey, ['BTN_PRESUPUESTO','BTN_REUNION','BTN_KITDIGITAL'], true)) {
             return "Solicitar información";
         }
 
-        // Hero
         if ($tokenKey === 'HERO_H1') return "{$kw} con estructura y copy que convierten";
         if ($tokenKey === 'HERO_KICKER') return "Mensaje claro, ejecución rápida";
+
+        // FAQ típicos si tu template usa FAQ_1_Q etc
+        if (preg_match('/^FAQ_(\d+)_Q$/', $tokenKey)) return "¿Qué incluye el servicio?";
+        if (preg_match('/^FAQ_(\d+)_A$/', $tokenKey)) return "Incluye estructura, textos y bloques listos para publicar.";
 
         return "Contenido para {$kw}";
     }
@@ -487,6 +490,12 @@ PROMPT;
         return $text;
     }
 
+    /**
+     * ✅ Parser robusto:
+     * - Acepta JSON plano
+     * - Si DeepSeek agrupa en PLAIN_KEYS/HTML_KEYS, lo aplana
+     * - Elimina keys inválidas ("" o espacios)
+     */
     private function parseJsonStrict(string $raw): array
     {
         $raw = trim((string)$raw);
@@ -502,11 +511,30 @@ PROMPT;
 
         $data = json_decode($raw, true);
         if (!is_array($data)) {
-            $snip = mb_substr($raw, 0, 700);
+            $snip = mb_substr($raw, 0, 900);
             throw new \RuntimeException('DeepSeek no devolvió JSON válido. Snippet: ' . $snip);
         }
 
-        return $data;
+        // Si viene agrupado, lo aplanamos
+        $flat = [];
+        if (isset($data['PLAIN_KEYS']) && is_array($data['PLAIN_KEYS'])) {
+            foreach ($data['PLAIN_KEYS'] as $k => $v) $flat[$k] = $v;
+        }
+        if (isset($data['HTML_KEYS']) && is_array($data['HTML_KEYS'])) {
+            foreach ($data['HTML_KEYS'] as $k => $v) $flat[$k] = $v;
+        }
+        if (!empty($flat)) $data = $flat;
+
+        // Eliminar keys inválidas
+        $clean = [];
+        foreach ($data as $k => $v) {
+            if (!is_string($k)) continue;
+            $k2 = trim($k);
+            if ($k2 === '') continue;
+            $clean[$k2] = $v;
+        }
+
+        return $clean;
     }
 
     // ===========================================================
@@ -541,7 +569,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // Brief (igual que tenías, suficiente)
+    // Brief
     // ===========================================================
     private function creativeBrief(string $keyword): array
     {
