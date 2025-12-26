@@ -4,6 +4,7 @@ namespace App\Jobs;
 
 use Illuminate\Bus\Queueable;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -32,13 +33,12 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         public string $keyword
     ) {
         /**
-         * ✅ FIX: el job_uuid NO debe ser determinístico por input,
-         * porque si vuelves a “generar otro nuevo” con mismo keyword/tipo/etc,
-         * te regresaba el registro anterior.
+         * ✅ IMPORTANTE:
+         * Antes: job_uuid determinístico por input -> si generas de nuevo con mismo keyword/tipo/etc
+         * te agarraba el registro anterior.
          *
-         * Ahora:
-         * - job_uuid = UUID único por dispatch (36 chars)
-         * - en retries se conserva porque el job se re-serializa con el mismo valor.
+         * Ahora: UUID único por dispatch (36 chars).
+         * En retries se conserva porque el job se re-serializa con el mismo valor.
          */
         $this->jobUuid = (string) Str::uuid();
     }
@@ -49,10 +49,10 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
         try {
             // ===========================================================
-            // 1) Registro por job_uuid (único por dispatch; re-usable en retries)
+            // 1) Registro por job_uuid (único por dispatch; estable en retries)
             // ===========================================================
             $registro = $this->getOrCreateRegistro();
-            $this->registroId = (int)$registro->id_dominio_contenido_detalle;
+            $this->registroId = (int) $registro->id_dominio_contenido_detalle;
 
             // Si ya está generado por ESTE MISMO job_uuid, no regenerar
             if ($registro->estatus === 'generado' && !empty($registro->contenido_html)) {
@@ -159,7 +159,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             }
 
             // ===========================================================
-            // 5) Template + reemplazo tokens (pretty + legacy)
+            // 5) Template + reemplazo tokens (pretty + legacy, tolerante a espacios/case)
             // ===========================================================
             [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
@@ -337,7 +337,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $a = $this->parseJsonStrict($raw);
             return $this->mergeWithSkeleton($a);
         } catch (\Throwable $e) {
-            $loose = $this->parseJsonLoose($raw);
+            $loose  = $this->parseJsonLoose($raw);
             $merged = $this->mergeWithSkeleton($loose);
 
             if (trim($this->toStr($merged['hero_h1'] ?? '')) !== '' || trim($this->toStr($merged['pack_h2'] ?? '')) !== '') {
@@ -391,8 +391,8 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
     private function repairJsonViaDeepseek(string $apiKey, string $model, string $broken, array $brief): string
     {
-        $angle = $this->toStr($brief['angle'] ?? '');
-        $tone  = $this->toStr($brief['tone'] ?? '');
+        $angle  = $this->toStr($brief['angle'] ?? '');
+        $tone   = $this->toStr($brief['tone'] ?? '');
         $broken = mb_substr(trim((string)$broken), 0, 9000);
 
         $prompt = <<<PROMPT
@@ -536,7 +536,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // VALIDATE / FALLBACKS (igual que tu versión)
+    // VALIDATE / REPAIR (y FIX del "HTML vacío" en features/faq)
     // ===========================================================
     private function validateOrRepairCopy(
         string $apiKey,
@@ -630,15 +630,22 @@ PROMPT;
         return $this->deepseekText($apiKey, $model, $prompt, maxTokens: 3400, temperature: 0.20, topP: 0.90, jsonMode: true);
     }
 
+    /**
+     * ✅ FIX CLAVE:
+     * - Normaliza HTML permitiendo SOLO <p><strong><br>
+     * - Si el modelo devuelve <ul> o algo no permitido, no queda vacío: lo envuelve en <p>texto plano</p>
+     * - Asegura features=4 y faq=9 con p_html/a_html siempre válidos
+     */
     private function sanitizeAndNormalizeCopy(array $copy): array
     {
         $copy['features'] = isset($copy['features']) && is_array($copy['features']) ? $copy['features'] : [];
         $copy['faq']      = isset($copy['faq']) && is_array($copy['faq']) ? $copy['faq'] : [];
 
         foreach (['hero_p_html','kit_p_html','pack_p_html','clients_p_html','kitdigital_p_html'] as $k) {
-            if (isset($copy[$k])) {
-                $copy[$k] = $this->keepAllowedInlineHtml($this->stripH1Tags($this->toStr($copy[$k])));
-            }
+            $copy[$k] = $this->normalizeHtmlOrWrap(
+                $copy[$k] ?? '',
+                "Texto breve y listo para adaptar."
+            );
         }
 
         if (isset($copy['seo_title'])) {
@@ -647,16 +654,69 @@ PROMPT;
             $copy['seo_title'] = $seo;
         }
 
+        // FEATURES
         if (count($copy['features']) > 4) $copy['features'] = array_slice($copy['features'], 0, 4);
+        while (count($copy['features']) < 4) $copy['features'][] = ['title' => '', 'p_html' => ''];
+
+        for ($i = 0; $i < 4; $i++) {
+            $f = $copy['features'][$i];
+            if (!is_array($f)) $f = [];
+
+            $t = trim(strip_tags($this->toStr($f['title'] ?? '')));
+            if ($t === '') $t = "Bloque " . ($i + 1);
+
+            $p = $this->normalizeHtmlOrWrap(
+                $f['p_html'] ?? '',
+                "Texto breve y reutilizable."
+            );
+
+            $copy['features'][$i] = ['title' => $t, 'p_html' => $p];
+        }
+
+        // FAQ
         if (count($copy['faq']) > 9) $copy['faq'] = array_slice($copy['faq'], 0, 9);
+        while (count($copy['faq']) < 9) $copy['faq'][] = ['q' => '', 'a_html' => ''];
+
+        for ($i = 0; $i < 9; $i++) {
+            $q = $copy['faq'][$i];
+            if (!is_array($q)) $q = [];
+
+            $qt = trim(strip_tags($this->toStr($q['q'] ?? '')));
+            if ($qt === '') $qt = "Pregunta " . ($i + 1);
+
+            $ah = $this->normalizeHtmlOrWrap(
+                $q['a_html'] ?? '',
+                "Respuesta breve y clara."
+            );
+
+            $copy['faq'][$i] = ['q' => $qt, 'a_html' => $ah];
+        }
 
         return $copy;
+    }
+
+    private function normalizeHtmlOrWrap(mixed $html, string $fallbackText): string
+    {
+        $raw = $this->toStr($html);
+        $raw = $this->stripH1Tags($raw);
+
+        $clean = $this->keepAllowedInlineHtml($raw);
+
+        if ($clean === '' || $this->isBlankHtml($clean) || preg_match('~<p>\s*</p>~i', $clean)) {
+            $txt = trim(preg_replace('~\s+~u', ' ', strip_tags($raw)));
+            if ($txt === '') $txt = $fallbackText;
+            $txt = htmlspecialchars($txt, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            return "<p>{$txt}</p>";
+        }
+
+        return $clean;
     }
 
     private function validateAndFixCopy(array $copy): array
     {
         $copy = $this->sanitizeAndNormalizeCopy($copy);
 
+        // fallback fuerte antes de validar
         $this->applyDynamicFallbacks($copy, force: true);
 
         foreach ([
@@ -694,6 +754,7 @@ PROMPT;
             $this->requireHtml($q['a_html'] ?? '', "faq[$i].a_html");
         }
 
+        // clients_subtitle corto
         $s = trim(strip_tags($this->toStr($copy['clients_subtitle'] ?? '')));
         $words = preg_split('~\s+~u', $s, -1, PREG_SPLIT_NO_EMPTY);
         if ($words && count($words) > 12) $copy['clients_subtitle'] = implode(' ', array_slice($words, 0, 12));
@@ -750,10 +811,8 @@ PROMPT;
         if ($needHtml('kitdigital_p_html')) $copy['kitdigital_p_html'] = "<p>Si aplica, te guiamos en el proceso y dejamos la entrega lista para publicar con pasos claros y entregables definidos.</p>";
         if ($needText('btn_kitdigital'))    $copy['btn_kitdigital'] = $this->pick(["Ver información","Consultar","Empezar"]);
 
-        if (!isset($copy['features']) || !is_array($copy['features'])) $copy['features'] = [];
-        if (!isset($copy['faq']) || !is_array($copy['faq'])) $copy['faq'] = [];
-
-        if ($hard || count($copy['features']) !== 4) {
+        // hard fallback de features/faq si algo se rompió
+        if ($hard || !isset($copy['features']) || !is_array($copy['features']) || count($copy['features']) !== 4) {
             $copy['features'] = [
                 ['title' => "Mensaje claro", 'p_html' => "<p>Texto directo, sin ruido, fácil de escanear y adaptar.</p>"],
                 ['title' => "Estructura con intención", 'p_html' => "<p>Secciones ordenadas para guiar lectura y decisión.</p>"],
@@ -762,7 +821,7 @@ PROMPT;
             ];
         }
 
-        if ($hard || count($copy['faq']) !== 9) {
+        if ($hard || !isset($copy['faq']) || !is_array($copy['faq']) || count($copy['faq']) !== 9) {
             $copy['faq'] = [];
             $qTpl = [
                 "¿Qué incluye este contenido?",
@@ -796,7 +855,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // TOKENS: pretty + legacy, y tolerante a espacios/case
+    // TOKENS: pretty + legacy, tolerante a espacios/case
     // ===========================================================
     private function fillElementorTemplate_byTokens_withStats(array $tpl, array $copy): array
     {
@@ -874,7 +933,7 @@ PROMPT;
         // universales ampliados
         foreach ($this->buildUniversalTokenValues($copy) as $k => $v) $dict[$k] = $v;
 
-        // legacy aliases
+        // legacy aliases ({{H_01}}, {{P_01}}, {{BTN_01}}, {{IL_01}} etc.)
         foreach ($this->buildLegacyTokenAliasesFromDict($dict) as $k => $v) $dict[$k] = $v;
 
         return $dict;
@@ -883,7 +942,6 @@ PROMPT;
     private function buildUniversalTokenValues(array $copy): array
     {
         $out = [];
-
         $maxSections = 120;
         $maxBadges   = 30;
 
@@ -892,7 +950,6 @@ PROMPT;
             $out["{{SECTION_{$i}_P}}"]     = "<p>Texto breve y adaptable para esta sección.</p>";
             $out["{{BULLET_{$i}}}"]        = "Punto {$i}";
         }
-
         for ($i=1; $i<=$maxBadges; $i++) $out["{{BADGE_{$i}}}"] = "Etiqueta {$i}";
 
         $out["{{CTA_1_TITLE}}"] = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? '')));
@@ -1014,6 +1071,7 @@ PROMPT;
 
         $orig = $node;
 
+        // tolera: {{TOKEN}}, {{ TOKEN }}, {{token}}
         $node = preg_replace_callback('/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/', function ($m) use ($dictNorm) {
             $k = strtoupper($m[1]);
             return array_key_exists($k, $dictNorm) ? (string)$dictNorm[$k] : $m[0];
@@ -1041,7 +1099,7 @@ PROMPT;
         return $found;
     }
 
-    // Post-pass opcional
+    // Post-pass opcional para textos fijos
     private function forceReplaceStaticTextsInTemplate(array $tpl, array $copy): array
     {
         $mapExact = [];
