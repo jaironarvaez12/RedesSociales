@@ -31,13 +31,16 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         public string $tipo,
         public string $keyword
     ) {
-        // ✅ Idempotencia REAL por input, pero compatible con char(36)
-        $base = (int)$this->idDominioContenido . '|' .
-                (int)$this->idDominio . '|' .
-                trim((string)$this->tipo) . '|' .
-                mb_strtolower(trim((string)$this->keyword));
-
-        $this->jobUuid = $this->uuid36FromMd5(md5($base)); // 36 chars
+        /**
+         * ✅ FIX: el job_uuid NO debe ser determinístico por input,
+         * porque si vuelves a “generar otro nuevo” con mismo keyword/tipo/etc,
+         * te regresaba el registro anterior.
+         *
+         * Ahora:
+         * - job_uuid = UUID único por dispatch (36 chars)
+         * - en retries se conserva porque el job se re-serializa con el mismo valor.
+         */
+        $this->jobUuid = (string) Str::uuid();
     }
 
     public function handle(): void
@@ -46,12 +49,12 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
         try {
             // ===========================================================
-            // 1) Registro idempotente + seguro en concurrencia
+            // 1) Registro por job_uuid (único por dispatch; re-usable en retries)
             // ===========================================================
             $registro = $this->getOrCreateRegistro();
             $this->registroId = (int)$registro->id_dominio_contenido_detalle;
 
-            // Si ya está generado, NO regenerar (idempotencia)
+            // Si ya está generado por ESTE MISMO job_uuid, no regenerar
             if ($registro->estatus === 'generado' && !empty($registro->contenido_html)) {
                 return;
             }
@@ -156,19 +159,14 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             }
 
             // ===========================================================
-            // 5) Template + reemplazo tokens
+            // 5) Template + reemplazo tokens (pretty + legacy)
             // ===========================================================
             [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
-            [$filled, $replacedCount, $remaining] = $this->fillElementorTemplate_byPrettyTokens_withStats($tpl, $final);
+            [$filled, $replacedCount, $remaining] = $this->fillElementorTemplate_byTokens_withStats($tpl, $final);
 
-            // ✅ NO uses umbral fijo ">=8" (eso rompe plantillas pequeñas)
             if ($replacedCount < 1) {
-                // Debug útil: si no hay tokens, o no matchean
-                if (empty($remaining)) {
-                    throw new \RuntimeException("NO_RETRY: No se reemplazó ningún token y NO se detectaron tokens {{...}} en el template. Template: {$tplPath}");
-                }
-                throw new \RuntimeException("NO_RETRY: No se reemplazó ningún token. Tokens detectados: " . implode(' | ', array_slice($remaining, 0, 50)) . " | Template: {$tplPath}");
+                throw new \RuntimeException("NO_RETRY: No se reemplazó ningún token. Template: {$tplPath}");
             }
             if (!empty($remaining)) {
                 throw new \RuntimeException("NO_RETRY: Tokens sin reemplazar: " . implode(' | ', array_slice($remaining, 0, 50)));
@@ -218,7 +216,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
     }
 
     // ===========================================================
-    // Registro idempotente (job_uuid UNIQUE)
+    // Registro por job_uuid (único por dispatch)
     // ===========================================================
     private function getOrCreateRegistro(): Dominios_Contenido_DetallesModel
     {
@@ -227,30 +225,20 @@ class GenerarContenidoKeywordJob implements ShouldQueue
 
         try {
             return Dominios_Contenido_DetallesModel::create([
-                'job_uuid'             => $this->jobUuid,
-                'id_dominio_contenido' => (int)$this->idDominioContenido,
-                'id_dominio'           => (int)$this->idDominio,
-                'tipo'                 => $this->tipo,
-                'keyword'              => $this->keyword,
-                'estatus'              => 'en_proceso',
-                'modelo'               => env('DEEPSEEK_MODEL', 'deepseek-chat'),
+                'job_uuid'              => $this->jobUuid,
+                'id_dominio_contenido'  => (int)$this->idDominioContenido,
+                'id_dominio'            => (int)$this->idDominio,
+                'tipo'                  => $this->tipo,
+                'keyword'               => $this->keyword,
+                'estatus'               => 'en_proceso',
+                'modelo'                => env('DEEPSEEK_MODEL', 'deepseek-chat'),
             ]);
         } catch (\Throwable $e) {
-            // si otro worker ganó la carrera por UNIQUE
+            // si otro worker ganó la carrera por UNIQUE(job_uuid)
             $again = Dominios_Contenido_DetallesModel::where('job_uuid', $this->jobUuid)->first();
             if ($again) return $again;
             throw $e;
         }
-    }
-
-    private function uuid36FromMd5(string $md5): string
-    {
-        // 32 hex -> 36 con guiones estilo uuid
-        return substr($md5, 0, 8) . '-' .
-               substr($md5, 8, 4) . '-' .
-               substr($md5, 12, 4) . '-' .
-               substr($md5, 16, 4) . '-' .
-               substr($md5, 20, 12);
     }
 
     // ===========================================================
@@ -548,7 +536,7 @@ PROMPT;
     }
 
     // ===========================================================
-    // VALIDATE / FALLBACKS
+    // VALIDATE / FALLBACKS (igual que tu versión)
     // ===========================================================
     private function validateOrRepairCopy(
         string $apiKey,
@@ -569,13 +557,11 @@ PROMPT;
         } catch (\Throwable $e) {
             $msg = $e->getMessage();
 
-            // Si es vacío -> fallback fuerte y seguimos
             if (str_contains($msg, 'Campo vacío generado:') || str_contains($msg, 'HTML vacío generado:')) {
                 $this->applyDynamicFallbacks($copy, force: true);
                 return $this->validateAndFixCopy($copy);
             }
 
-            // Repair IA 1 vez, si falla => fallback hard
             $repairRaw = $this->repairMissingFieldsViaDeepseek(
                 $apiKey, $model, $copy, $brief, $stage, $msg, $noRepetirTitles, $noRepetirCorpus
             );
@@ -671,7 +657,6 @@ PROMPT;
     {
         $copy = $this->sanitizeAndNormalizeCopy($copy);
 
-        // fallback fuerte antes de validar
         $this->applyDynamicFallbacks($copy, force: true);
 
         foreach ([
@@ -709,7 +694,6 @@ PROMPT;
             $this->requireHtml($q['a_html'] ?? '', "faq[$i].a_html");
         }
 
-        // clients_subtitle corto
         $s = trim(strip_tags($this->toStr($copy['clients_subtitle'] ?? '')));
         $words = preg_split('~\s+~u', $s, -1, PREG_SPLIT_NO_EMPTY);
         if ($words && count($words) > 12) $copy['clients_subtitle'] = implode(' ', array_slice($words, 0, 12));
@@ -812,18 +796,14 @@ PROMPT;
     }
 
     // ===========================================================
-    // TOKENS (Soporta "pretty" + "legacy")
+    // TOKENS: pretty + legacy, y tolerante a espacios/case
     // ===========================================================
-    private function fillElementorTemplate_byPrettyTokens_withStats(array $tpl, array $copy): array
+    private function fillElementorTemplate_byTokens_withStats(array $tpl, array $copy): array
     {
         $copy = $this->validateAndFixCopy($copy);
+        $dict = $this->buildTokenDictionary($copy);
 
-        // dict con llaves {{TOKEN}}
-        $dict = $this->buildPrettyTokenDictionary($copy);
-
-        // Normaliza para reemplazo tolerante a espacios/case:
-        //   {{ HERO_H1 }} / {{hero_h1}} / {{HERO_H1}}
-        // dictNorm: TOKEN_NAME => value
+        // Normaliza dict a: TOKEN_NAME => value
         $dictNorm = [];
         foreach ($dict as $tok => $val) {
             $name = strtoupper(trim((string)$tok));
@@ -839,11 +819,12 @@ PROMPT;
         return [$tpl, $replacedCount, $remaining];
     }
 
-    private function buildPrettyTokenDictionary(array $copy): array
+    private function buildTokenDictionary(array $copy): array
     {
         $featuresListHtml = $this->buildFeaturesListHtml($copy);
 
         $dict = [
+            // pretty
             '{{HERO_KICKER}}' => trim(strip_tags($this->toStr($copy['hero_kicker']))),
             '{{HERO_H1}}'     => trim(strip_tags($this->toStr($copy['hero_h1']))),
             '{{HERO_P}}'      => $this->keepAllowedInlineHtml($this->toStr($copy['hero_p_html'])),
@@ -875,7 +856,6 @@ PROMPT;
             '{{PROJECTS_TITLE}}'    => trim(strip_tags($this->toStr($copy['projects_title']))),
 
             '{{FAQ_TITLE}}'         => trim(strip_tags($this->toStr($copy['faq_title']))),
-
             '{{FINAL_CTA}}'         => trim(strip_tags($this->toStr($copy['final_cta_h3']))),
 
             '{{BTN_PRESUPUESTO}}'   => trim(strip_tags($this->toStr($copy['btn_presupuesto']))),
@@ -886,25 +866,20 @@ PROMPT;
             '{{BTN_KITDIGITAL}}'    => trim(strip_tags($this->toStr($copy['btn_kitdigital']))),
         ];
 
-        for ($i = 0; $i < 9; $i++) {
-            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = trim(strip_tags($this->toStr($copy['faq'][$i]['q'])));;
+        for ($i=0; $i<9; $i++) {
+            $dict['{{FAQ_' . ($i + 1) . '_Q}}'] = trim(strip_tags($this->toStr($copy['faq'][$i]['q'])));
             $dict['{{FAQ_' . ($i + 1) . '_A}}'] = $this->keepAllowedInlineHtml($this->toStr($copy['faq'][$i]['a_html']));
         }
 
-        // Tokens universales (ampliados)
-        foreach ($this->buildUniversalTokenValues($copy) as $tok => $val) {
-            $dict[$tok] = $val;
-        }
+        // universales ampliados
+        foreach ($this->buildUniversalTokenValues($copy) as $k => $v) $dict[$k] = $v;
 
-        // ✅ Aliases LEGACY para soportar plantillas con {{H_01}}, {{P_01}}, {{BTN_01}}, {{IL_01}}, etc.
-        foreach ($this->buildLegacyTokenAliasesFromDict($dict) as $tok => $val) {
-            $dict[$tok] = $val;
-        }
+        // legacy aliases
+        foreach ($this->buildLegacyTokenAliasesFromDict($dict) as $k => $v) $dict[$k] = $v;
 
         return $dict;
     }
 
-    // ✅ UNIVERSALES ampliados (antes 12/6: ahora 120/30)
     private function buildUniversalTokenValues(array $copy): array
     {
         $out = [];
@@ -917,6 +892,7 @@ PROMPT;
             $out["{{SECTION_{$i}_P}}"]     = "<p>Texto breve y adaptable para esta sección.</p>";
             $out["{{BULLET_{$i}}}"]        = "Punto {$i}";
         }
+
         for ($i=1; $i<=$maxBadges; $i++) $out["{{BADGE_{$i}}}"] = "Etiqueta {$i}";
 
         $out["{{CTA_1_TITLE}}"] = trim(strip_tags($this->toStr($copy['final_cta_h3'] ?? '')));
@@ -934,7 +910,6 @@ PROMPT;
         return $out;
     }
 
-    // ✅ NUEVO: aliases legacy -> valores reales del dict
     private function buildLegacyTokenAliasesFromDict(array $dict): array
     {
         $out = [];
@@ -948,7 +923,6 @@ PROMPT;
         $maxBTN = 60;
         $maxIL  = 120;
 
-        // H_01..H_12 principales; 13+ => SECTION_(i-12)_TITLE
         for ($i=1; $i<=$maxH; $i++) {
             $n2 = str_pad((string)$i, 2, "0", STR_PAD_LEFT);
 
@@ -969,11 +943,10 @@ PROMPT;
                 $val = $get("{{SECTION_{$sec}_TITLE}}", "Sección {$sec}");
             }
 
-            $out["{{H_{$n2}}}"] = $val; // {{H_01}}
-            $out["{{H_{$i}}}"]  = $val; // {{H_1}} por si existe
+            $out["{{H_{$n2}}}"] = $val;
+            $out["{{H_{$i}}}"]  = $val;
         }
 
-        // P_01..P_05 principales; 06+ => SECTION_(i-5)_P
         for ($i=1; $i<=$maxP; $i++) {
             $n2 = str_pad((string)$i, 2, "0", STR_PAD_LEFT);
 
@@ -991,7 +964,6 @@ PROMPT;
             $out["{{P_{$i}}}"]  = $val;
         }
 
-        // BTN_01.. = botones principales / CTAs
         for ($i=1; $i<=$maxBTN; $i++) {
             $n2 = str_pad((string)$i, 2, "0", STR_PAD_LEFT);
 
@@ -1007,7 +979,6 @@ PROMPT;
             $out["{{BTN_{$i}}}"]  = $val;
         }
 
-        // IL_01.. = bullets/icon list items
         for ($i=1; $i<=$maxIL; $i++) {
             $n2 = str_pad((string)$i, 2, "0", STR_PAD_LEFT);
             $val = $get("{{BULLET_{$i}}}", "Punto {$i}");
@@ -1032,8 +1003,6 @@ PROMPT;
         return implode('', $parts);
     }
 
-    // ✅ Reemplazo tolerante a espacios/case: {{ HERO_H1 }} == {{hero_h1}} == {{HERO_H1}}
-    // $dictNorm: TOKEN_NAME => value
     private function replaceTokensDeep(mixed &$node, array $dictNorm, int &$count): void
     {
         if (is_array($node)) {
@@ -1053,7 +1022,6 @@ PROMPT;
         if ($node !== $orig) $count++;
     }
 
-    // ✅ Detecta tokens restantes aunque tengan espacios: {{ H_01 }}
     private function collectRemainingTokensDeep(mixed $node): array
     {
         $found = [];
@@ -1062,7 +1030,7 @@ PROMPT;
             if (!is_string($n) || $n === '') return;
             if (preg_match_all('/\{\{\s*[A-Za-z0-9_]+\s*\}\}/', $n, $m)) {
                 foreach ($m[0] as $tok) {
-                    $tok = preg_replace('/\s+/', '', $tok); // normaliza espacios
+                    $tok = preg_replace('/\s+/', '', $tok);
                     $found[] = $tok;
                 }
             }
