@@ -4,7 +4,6 @@ namespace App\Jobs;
 
 use Illuminate\Bus\Queueable;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -31,8 +30,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         public string $tipo,
         public string $keyword
     ) {
-        // ✅ UUID real por ejecución => siempre genera registro NUEVO al despachar otro job
-        // (y se mantiene estable en retries)
+        // ✅ UUID real por ejecución (nuevo job = nuevo registro)
         $this->jobUuid = (string) Str::uuid();
     }
 
@@ -41,9 +39,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         $registro = null;
 
         try {
-            // ===========================================================
-            // 1) Registro por job_uuid (solo para retries del mismo job)
-            // ===========================================================
+            // 1) Registro por job_uuid (retries del MISMO job)
             $registro = $this->getOrCreateRegistro();
             $this->registroId = (int) $registro->id_dominio_contenido_detalle;
 
@@ -57,29 +53,21 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 'error'   => null,
             ]);
 
-            // ===========================================================
             // 2) Config IA
-            // ===========================================================
             $apiKey = (string) env('DEEPSEEK_API_KEY', '');
             $model  = (string) env('DEEPSEEK_MODEL', 'deepseek-chat');
             if ($apiKey === '') throw new \RuntimeException('NO_RETRY: DEEPSEEK_API_KEY no configurado');
 
-            // ===========================================================
-            // 3) Cargar plantilla (dominio/env/default=179)
-            // ===========================================================
+            // 3) Plantilla estándar 179 (o la del dominio/env)
             [$tpl, $tplPath] = $this->loadElementorTemplateForDomainWithPath((int)$this->idDominio);
 
-            // ===========================================================
-            // 4) Detectar tokens reales {{TOKEN}} con contexto
-            // ===========================================================
+            // 4) Tokens meta
             $tokensMeta = $this->collectTokensMeta($tpl);
             if (empty($tokensMeta)) {
                 throw new \RuntimeException("NO_RETRY: La plantilla no contiene tokens {{TOKEN}}. Template: {$tplPath}");
             }
 
-            // ===========================================================
-            // 5) Historial anti-repetición (títulos + corpus)
-            // ===========================================================
+            // 5) Historial anti-repetición
             $prev = Dominios_Contenido_DetallesModel::where('id_dominio_contenido', (int)$this->idDominioContenido)
                 ->whereNotNull('draft_html')
                 ->orderByDesc('id_dominio_contenido_detalle')
@@ -96,16 +84,13 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $noRepetirCorpus = $this->compactHistory($usedCorpus, 2500);
             $lastCorpus = trim((string)($usedCorpus[0] ?? ''));
 
-            // ===========================================================
-            // 6) Generación (2 ciclos máx si está demasiado parecido)
-            // ===========================================================
+            // 6) Generación (2 ciclos si se parece demasiado)
             $finalValues = null;
 
             for ($cycle = 1; $cycle <= 2; $cycle++) {
                 $brief = $this->creativeBrief();
                 $seed  = $this->stableSeedInt($this->jobUuid . '|' . (int)$this->registroId . "|cycle={$cycle}");
 
-                // PLAN de temas (cambia en cada job/cycle)
                 $themePlan = $this->buildThemePlan($seed, 40, 26);
 
                 $values = $this->generateValuesForTemplateTokensBatched(
@@ -119,22 +104,20 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                     noRepetirCorpus: $noRepetirCorpus
                 );
 
-                // Similaridad vs último
+                // ✅ BLINDAJE: convierte TODO a string (por si algo quedó array)
+                $values = $this->stringifyValues($values);
+
                 $currentText = $this->valuesToPlainText($values);
                 $sim = ($lastCorpus !== '') ? $this->jaccardBigrams($currentText, $lastCorpus) : 0.0;
 
                 $finalValues = $values;
 
-                if ($sim < 0.45) break; // si aún se parece mucho, reintenta 1 vez
+                if ($sim < 0.45) break;
             }
 
-            if (!is_array($finalValues)) {
-                throw new \RuntimeException('No se pudo generar valores finales');
-            }
+            if (!is_array($finalValues)) throw new \RuntimeException('No se pudo generar valores finales');
 
-            // ===========================================================
             // 7) Reemplazar tokens
-            // ===========================================================
             [$filled, $replacedCount, $remainingTokens] = $this->fillTemplateTokensWithStats($tpl, $finalValues);
 
             if ($replacedCount < 1) {
@@ -144,18 +127,14 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 throw new \RuntimeException("NO_RETRY: Tokens sin reemplazar: " . implode(' | ', array_slice($remainingTokens, 0, 80)));
             }
 
-            // ===========================================================
             // 8) Title + slug
-            // ===========================================================
             $title = trim(strip_tags($this->toStr($finalValues['HERO_H1'] ?? $finalValues['SEO_TITLE'] ?? $this->keyword)));
             if ($title === '') $title = $this->keyword;
 
             $slugBase = Str::slug($title ?: $this->keyword);
             $slug = $slugBase . '-' . $registro->id_dominio_contenido_detalle;
 
-            // ===========================================================
             // 9) Guardar
-            // ===========================================================
             $registro->update([
                 'title'          => $title,
                 'slug'           => $slug,
@@ -184,9 +163,6 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         }
     }
 
-    // ===========================================================
-    // Registro idempotente SOLO para retries del mismo job_uuid
-    // ===========================================================
     private function getOrCreateRegistro(): Dominios_Contenido_DetallesModel
     {
         $existing = Dominios_Contenido_DetallesModel::where('job_uuid', $this->jobUuid)->first();
@@ -203,23 +179,19 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         ]);
     }
 
-    // ===========================================================
-    // TEMPLATE LOADER (default = 179 estándar)
-    // ===========================================================
+    // ========================= TEMPLATE LOADER =========================
     private function loadElementorTemplateForDomainWithPath(int $idDominio): array
     {
         $dominio = DominiosModel::where('id_dominio', $idDominio)->first();
         if (!$dominio) throw new \RuntimeException("NO_RETRY: Dominio no encontrado (id={$idDominio})");
 
         $templateRel = trim((string)($dominio->elementor_template_path ?? ''));
-
         if ($templateRel === '') $templateRel = trim((string)env('ELEMENTOR_TEMPLATE_PATH', ''));
 
         // ✅ estándar
         if ($templateRel === '') $templateRel = 'elementor/elementor-179-2025-12-27.json';
 
         $templateRel = str_replace(['https:', 'http:'], '', $templateRel);
-
         if (preg_match('~^https?://~i', $templateRel)) {
             $u = parse_url($templateRel);
             $templateRel = $u['path'] ?? $templateRel;
@@ -243,9 +215,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         return [$tpl, $templatePath];
     }
 
-    // ===========================================================
-    // Detectar tokens + tipo (plain vs editor) + wrap_p
-    // ===========================================================
+    // ========================= TOKENS META =========================
     private function collectTokensMeta(array $tpl): array
     {
         $meta = []; // TOKEN => ['type' => 'plain'|'editor', 'wrap_p' => bool]
@@ -260,7 +230,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                             $tok = (string)$tok;
                             if ($tok === '') continue;
 
-                            $type = ($k === 'editor') ? 'editor' : 'plain';
+                            $type  = ($k === 'editor') ? 'editor' : 'plain';
                             $wrapP = (bool) preg_match('~<p>\s*\{\{' . preg_quote($tok, '~') . '\}\}\s*</p>~i', $v);
 
                             if (!isset($meta[$tok])) {
@@ -278,14 +248,11 @@ class GenerarContenidoKeywordJob implements ShouldQueue
         };
 
         $walk($tpl);
-
         ksort($meta);
         return $meta;
     }
 
-    // ===========================================================
-    // Generación por lotes + plan de temas => siempre diferente
-    // ===========================================================
+    // ========================= GENERACIÓN BATCH =========================
     private function generateValuesForTemplateTokensBatched(
         string $apiKey,
         string $model,
@@ -332,7 +299,7 @@ class GenerarContenidoKeywordJob implements ShouldQueue
             $alreadySectionTitles = [];
             foreach ($values as $k => $v) {
                 if (preg_match('~^SECTION_\d+_TITLE$~', (string)$k)) {
-                    $alreadySectionTitles[] = trim(strip_tags((string)$v));
+                    $alreadySectionTitles[] = trim(strip_tags($this->toStr($v)));
                 }
             }
             $alreadySectionTitles = array_slice(array_filter($alreadySectionTitles), 0, 20);
@@ -343,6 +310,9 @@ class GenerarContenidoKeywordJob implements ShouldQueue
                 $planLines[] = "SECTION_{$i}: " . ($themePlan[$i] ?? 'Tema');
             }
             $planText = implode("\n", $planLines);
+
+            $editorList = implode(', ', $editorKeys);
+            $plainList  = implode(', ', $plainKeys);
 
             $prompt = <<<PROMPT
 Devuelve SOLO JSON válido (sin markdown). RESPUESTA MINIFICADA.
@@ -382,10 +352,10 @@ REGLAS:
 - No repitas la keyword en todas las líneas.
 
 LISTA editor:
-{implode(', ', $editorKeys)}
+{$editorList}
 
 LISTA plain:
-{implode(', ', $plainKeys)}
+{$plainList}
 
 ESQUEMA:
 {$schemaJson}
@@ -399,10 +369,10 @@ PROMPT;
                 $k = (string)$k;
                 $meta = $tokensMeta[$k] ?? ['type' => 'plain', 'wrap_p' => false];
 
-                // ✅ FIX: fuerza siempre string (evita Array to string conversion)
+                // ✅ SIEMPRE string
                 $val = $this->toStr($arr[$k] ?? '');
 
-                $val = $this->normalizeValueByTokenMeta($k, $val, $meta);
+                $val = $this->normalizeValueByTokenMeta($val, $meta);
 
                 if ($this->isEmptyValue($val)) {
                     $val = $this->fallbackForToken($k, $meta, $seed, $themePlan);
@@ -416,7 +386,7 @@ PROMPT;
         $seen = [];
         foreach ($values as $k => $v) {
             if (!preg_match('~^SECTION_(\d+)_P$~', (string)$k, $m)) continue;
-            $plain = mb_strtolower(trim(strip_tags((string)$v)));
+            $plain = mb_strtolower(trim(strip_tags($this->toStr($v))));
             if ($plain === '') continue;
 
             if (isset($seen[$plain])) {
@@ -436,9 +406,7 @@ PROMPT;
         return 10;
     }
 
-    // ===========================================================
-    // PLAN DE TEMAS (baraja con seed => siempre cambia)
-    // ===========================================================
+    // ========================= THEME PLAN =========================
     private function buildThemePlan(int $seed, int $poolSize = 40, int $sections = 26): array
     {
         $pool = [
@@ -511,9 +479,7 @@ PROMPT;
         return (int) (hexdec(substr(md5($s), 0, 8)) & 0x7fffffff);
     }
 
-    // ===========================================================
-    // DeepSeek
-    // ===========================================================
+    // ========================= DEEPSEEK =========================
     private function deepseekText(
         string $apiKey,
         string $model,
@@ -557,13 +523,10 @@ PROMPT;
         $data = $resp->json();
         $text = trim((string)($data['choices'][0]['message']['content'] ?? ''));
         if ($text === '') throw new \RuntimeException("DeepSeek returned empty text.");
-
         return $text;
     }
 
-    // ===========================================================
-    // Parse/Repair: solo keys esperadas
-    // ===========================================================
+    // ========================= PARSE / REPAIR =========================
     private function safeParseOrRepairForKeys(string $apiKey, string $model, string $raw, array $keys, array $brief, string $variation): array
     {
         try {
@@ -572,9 +535,7 @@ PROMPT;
         } catch (\Throwable $e) {
             $loose = $this->parseJsonLoosePairs($raw);
             $loose = $this->filterKeys($loose, $keys);
-            if (count($loose) >= max(2, (int)floor(count($keys) * 0.4))) {
-                return $loose;
-            }
+            if (count($loose) >= max(2, (int)floor(count($keys) * 0.4))) return $loose;
 
             $fixed = $this->repairJsonForKeys($apiKey, $model, $raw, $keys, $brief, $variation);
             try {
@@ -590,12 +551,13 @@ PROMPT;
     private function repairJsonForKeys(string $apiKey, string $model, string $broken, array $keys, array $brief, string $variation): string
     {
         $broken = mb_substr(trim((string)$broken), 0, 9000);
-        $briefAngle = $this->toStr($brief['angle'] ?? '');
-        $briefTone  = $this->toStr($brief['tone'] ?? '');
 
         $skel = [];
         foreach ($keys as $k) $skel[$k] = "";
         $schema = json_encode($skel, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        $briefAngle = $this->toStr($brief['angle'] ?? '');
+        $briefTone  = $this->toStr($brief['tone'] ?? '');
 
         $prompt = <<<PROMPT
 Devuelve SOLO JSON válido. RESPUESTA MINIFICADA.
@@ -603,10 +565,7 @@ VARIATION (NO imprimir): {$variation}
 
 Corrige el JSON roto y devuelve EXACTAMENTE las keys del ESQUEMA (sin agregar ni quitar).
 PROHIBIDO valores vacíos, PROHIBIDO keys vacías "" y PROHIBIDO arrays/objetos.
-
-Reglas:
-- Textos largos: solo texto + <strong> y <br>. NO uses <p>.
-- Textos cortos: sin HTML.
+Todos los valores deben ser STRING.
 
 Ángulo: {$briefAngle}
 Tono: {$briefTone}
@@ -624,10 +583,6 @@ PROMPT;
     private function parseJsonStrict(string $raw): array
     {
         $raw = trim((string)$raw);
-        $raw = preg_replace('~^```(?:json)?\s*~i', '', $raw);
-        $raw = preg_replace('~\s*```$~', '', $raw);
-        $raw = trim($raw);
-
         $start = strpos($raw, '{');
         $end   = strrpos($raw, '}');
         if ($start !== false && $end !== false && $end > $start) {
@@ -638,7 +593,6 @@ PROMPT;
         if (!is_array($data)) throw new \RuntimeException('JSON inválido');
 
         if (array_key_exists('', $data)) unset($data['']);
-
         return $data;
     }
 
@@ -672,10 +626,8 @@ PROMPT;
         return $out;
     }
 
-    // ===========================================================
-    // Normalización (según tokenMeta)
-    // ===========================================================
-    private function normalizeValueByTokenMeta(string $k, string $v, array $meta): string
+    // ========================= NORMALIZE / FALLBACK =========================
+    private function normalizeValueByTokenMeta(string $v, array $meta): string
     {
         $type  = $meta['type'] ?? 'plain';
         $wrapP = (bool)($meta['wrap_p'] ?? false);
@@ -720,7 +672,6 @@ PROMPT;
         $wrapP = (bool)($meta['wrap_p'] ?? false);
 
         $kw = $this->shortKw();
-
         $pick = function(array $arr) use ($seed, $tok) {
             $i = $this->stableSeedInt($seed . '|' . $tok) % max(1, count($arr));
             return $arr[$i] ?? $arr[0];
@@ -759,13 +710,12 @@ PROMPT;
         }
 
         if (str_starts_with($tok, 'BTN_')) {
-            $btn = match ($tok) {
+            return match ($tok) {
                 'BTN_PRESUPUESTO' => $pick(["Solicitar presupuesto","Pedir propuesta","Ver opciones"]),
                 'BTN_REUNION'     => $pick(["Agendar llamada","Reservar llamada","Hablar ahora"]),
                 'BTN_KITDIGITAL'  => $pick(["Ver información","Consultar","Empezar"]),
                 default           => $pick(["Ver opciones","Continuar"]),
             };
-            return $btn;
         }
 
         if ($tok === 'HERO_H1') return $pick([
@@ -779,12 +729,6 @@ PROMPT;
             "Estructura lista para publicar",
             "Mensaje directo, sin ruido",
             "Pensado para leads y acción",
-        ]);
-
-        if ($tok === 'PACK_H2') return $pick([
-            "Nuestro proceso y entregables",
-            "Cómo lo implementamos paso a paso",
-            "Estructura y mensajes por intención",
         ]);
 
         if ($tok === 'FAQ_TITLE') return "Preguntas frecuentes";
@@ -806,13 +750,14 @@ PROMPT;
         return ($type === 'editor' && !$wrapP) ? $generic : trim(strip_tags($generic));
     }
 
-    // ===========================================================
-    // Reemplazo tokens
-    // ===========================================================
+    // ========================= REEMPLAZO TOKENS (blindado) =========================
     private function fillTemplateTokensWithStats(array $tpl, array $values): array
     {
         $dict = [];
-        foreach ($values as $k => $v) $dict['{{' . $k . '}}'] = (string)$v;
+        foreach ($values as $k => $v) {
+            // ✅ NUNCA (string)$v
+            $dict['{{' . (string)$k . '}}'] = $this->toStr($v);
+        }
 
         $count = 0;
         $this->replaceTokensDeep($tpl, $dict, $count);
@@ -849,9 +794,7 @@ PROMPT;
         return $found;
     }
 
-    // ===========================================================
-    // Brief
-    // ===========================================================
+    // ========================= BRIEF =========================
     private function creativeBrief(): array
     {
         $angles = [
@@ -873,9 +816,7 @@ PROMPT;
         ];
     }
 
-    // ===========================================================
-    // Similaridad
-    // ===========================================================
+    // ========================= SIMILARIDAD =========================
     private function valuesToPlainText(array $values): string
     {
         $parts = [];
@@ -901,7 +842,7 @@ PROMPT;
     {
         $s = mb_strtolower($s);
         $s = preg_replace('~\s+~u', ' ', $s);
-        $s = trim($s);
+        $s = trim((string)$s);
         if ($s === '') return [];
         $chars = preg_split('~~u', $s, -1, PREG_SPLIT_NO_EMPTY);
         $out = [];
@@ -910,9 +851,7 @@ PROMPT;
         return $out;
     }
 
-    // ===========================================================
-    // Historial
-    // ===========================================================
+    // ========================= HISTORIAL =========================
     private function compactHistory(array $corpusArr, int $maxChars = 2500): string
     {
         $chunks = [];
@@ -937,15 +876,21 @@ PROMPT;
         $arr = json_decode($draftJson, true);
         if (!is_array($arr)) return '';
         $parts = [];
-        foreach ($arr as $k => $v) $parts[] = strip_tags($this->toStr($v));
+        foreach ($arr as $v) $parts[] = strip_tags($this->toStr($v));
         $txt = implode(' ', array_filter($parts));
         $txt = preg_replace('~\s+~u', ' ', (string)$txt);
         return trim((string)$txt);
     }
 
-    // ===========================================================
-    // Utils (✅ FIX anti Array->string)
-    // ===========================================================
+    // ========================= BLINDAJE STRINGS =========================
+    private function stringifyValues(array $values): array
+    {
+        $out = [];
+        foreach ($values as $k => $v) $out[(string)$k] = $this->toStr($v);
+        return $out;
+    }
+
+    // ========================= UTILS (ANTI Array->string) =========================
     private function toStr(mixed $v): string
     {
         if ($v === null) return '';
